@@ -1,0 +1,11 @@
+node_modules/
+dist/
+build/
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
+coverage/
+.vercel/
+frontend/src/api/schema.d.ts
