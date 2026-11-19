@@ -1,102 +1,97 @@
 # CONTRACT.md — Claude ⇄ Codex working agreement
 
-Two AI agents build one product in one repo. This file is the **treaty**. If a rule here conflicts with `CLAUDE.md` or `AGENTS.md`, this file wins.
+Baseline (decided by the owner, issue #1): **ASP.NET Core (.NET 10) + EF Core 10 + SQL Server on AWS; Flutter Android app distributed as an APK via Firebase App Distribution or a Google Drive link.**
 
-| Agent | Owns | Never edits |
+This file is the treaty between the two agents. If `CLAUDE.md` or `AGENTS.md` conflict with it, this file wins.
+
+## 0. Authority chain (highest first)
+
+1. `CONTRACT.md` (this file) — process, ownership, conventions
+2. `contract/openapi.yaml` — every endpoint, schema, enum, error shape
+3. `docs/ARCHITECTURE.md` — stack, data model, workflow, session model, gates
+4. `CLAUDE.md` / `AGENTS.md` — per-agent instructions
+5. `docs/CampusConnect_Competition_Problem_Statement.pdf` — original requirements
+
+If code and spec disagree, the spec is right until a contract PR says otherwise.
+
+## 1. Ownership
+
+| Area | Owner | Notes |
 |---|---|---|
-| **Claude** (frontend) | `/frontend/**` | `/backend/**` |
-| **Codex** (backend) | `/backend/**` | `/frontend/**` |
-| **Shared** | `/contract/**`, `/CONTRACT.md`, `/docs/**`, root configs | — (see change rules) |
+| `backend/src/**`, EF Core **migrations** | **Claude** | Claude is the **single migration owner**. No one else creates or edits migrations |
+| `backend/tests/**`, `mobile/**` (client integration) | **Codex** | Tests treat the API as a black box (WebApplicationFactory + SQL Server container). Codex builds the Flutter client against the contract |
+| `contract/**`, `docs/**`, `CONTRACT.md`, `CLAUDE.md`, `AGENTS.md`, root/CI/infra files | **Integrator = the human owner** | Agents *propose* via `contract/` or `docs/` PRs; the owner approves/merges |
 
-## 1. Single source of truth
+An agent never edits another owner's area. Need a change there? Handoff (§5) or a PR the owner/area-owner approves.
+Found a backend bug while testing? Codex writes a failing test + a handoff; Claude fixes it in `src`.
 
-`contract/openapi.yaml` (OpenAPI 3.1) defines every endpoint, schema, enum, error shape and role rule.
+## 2. Contract change protocol
 
-- **Backend** implements it exactly and validates requests/responses against it (zod schemas mirror the spec; a contract test fails CI on drift).
-- **Frontend** never hand-writes API types. It runs `npm run gen:api` → `frontend/src/api/schema.d.ts` (via `openapi-typescript`) and uses a typed client.
-- If code and spec disagree, **the spec is right** until a contract PR says otherwise.
-
-## 2. Change protocol (how to change the API)
-
-1. Open a branch named `contract/<short-name>` that touches **only** `contract/`, `CONTRACT.md` (and `docs/` if needed). No app code.
-2. PR title starts with `contract:`. Describe: what changed, why, breaking? (yes/no).
-3. The **other** agent (or the human) approves. Merge to `main`.
-4. Only then do both sides rebase and implement their half in separate PRs:
-   - `feat(be): …` — Codex
-   - `feat(fe): …` — Claude
-5. Additive changes (new optional field, new endpoint) are non-breaking. Removing/renaming/retyping anything is **breaking** → needs an explicit human OK and a note in `docs/CHANGELOG.md`.
-
-> Fast path for the competition clock: a contract PR may be self-merged if it is purely additive **and** the other agent is notified in the PR description. Never self-merge a breaking change.
+1. Branch `contract/<name>` touching only `contract/`, `CONTRACT.md`, `docs/`. PR title starts with `contract:`.
+2. State: what changed, why, breaking? (renamed/removed/retyped = breaking).
+3. Owner approves and merges. Only then both sides implement in separate PRs: `feat(be):` (Claude) and `feat(app):` / `test(be):` (Codex).
+4. Breaking changes need an explicit owner OK and an entry in `docs/CHANGELOG.md`.
+5. Additive, optional changes may be merged by the owner without waiting for the other agent, but must be announced in `docs/HANDOFF.md`.
 
 ## 3. Branching & PRs
 
-- `main` is always deployable. Never push to `main` directly (except the human during the last 30 min).
-- Branch prefixes: `fe/…` (Claude), `be/…` (Codex), `contract/…` (either), `docs/…`.
-- A PR touches **one side only**. If you need the other side to change, file a handoff (§5), do not edit it.
-- Conventional Commits: `feat(fe):`, `fix(be):`, `contract:`, `docs:`, `chore:`.
-- Squash-merge. Keep PRs under ~400 changed lines where possible.
+- `main` is always deployable. No direct pushes (owner may in the last 30 minutes).
+- Prefixes: `be/…` (Claude), `app/…` and `test/…` (Codex), `contract/…`, `docs/…`.
+- One owner's area per PR. Conventional Commits. Squash-merge.
 
-## 4. Conventions both sides must follow
+## 4. Wire conventions (both sides)
 
 | Topic | Rule |
 |---|---|
-| Base path | `/api/v1` |
-| Auth | `Authorization: Bearer <JWT>`; token from `/auth/login` or `/auth/register` |
-| Roles | `STUDENT`, `DEPT_ADMIN`, `SUPER_ADMIN` |
-| IDs | opaque strings (cuid). Frontend must never parse them |
-| Dates | ISO-8601 UTC strings |
-| Envelope | Success: `{ "data": … }` (lists add `page,pageSize,total`). Error: `{ "error": { code, message, fields? } }` |
-| Error codes | `UNAUTHORIZED` 401 · `FORBIDDEN` 403 · `NOT_FOUND` 404 · `CONFLICT`/`INVALID_TRANSITION` 409 · `VALIDATION_FAILED` 422 · `INTERNAL` 500 |
-| Naming | JSON is `camelCase`; enums are `UPPER_SNAKE` |
-| CORS | Backend allows only origins in `CORS_ORIGINS` env |
+| Base path | `/api` (health check at `/health`) |
+| Auth | `Authorization: Bearer <access JWT>` |
+| Roles | `Student`, `DepartmentAdmin`, `SuperAdmin` (exact strings) |
+| Status | `Pending`, `InProgress`, `Resolved`, `Rejected` |
+| IDs | user = GUID string · department/category = int32 · complaint/remark/notification = int64 |
+| Dates | ISO-8601 UTC |
+| JSON | `camelCase` properties, PascalCase enum values |
+| Success shape | Plain resource/array. Lists: `{ items, pageNumber, pageSize, totalCount }` |
+| Errors | RFC 7807 `application/problem+json` with stable `code`. Validation → **400** with `errors{field:[msgs]}` |
+| Codes | 400 validation · 401 unauthenticated/expired · 403 out of scope · 404 missing · 409 conflict / invalid transition / stale rowVersion · 429 rate limit |
+| Concurrency | Every complaint carries opaque `rowVersion`; status updates must echo it; stale → 409 `StaleRowVersion` |
 
-### Authorization is server-side only (non-negotiable — the PDF grades this)
+### Session model (all-or-nothing — do not ship half)
 
-- The backend decides scope for every request: STUDENT → own complaints; DEPT_ADMIN → own department; SUPER_ADMIN → all.
-- Out-of-scope direct access always returns **403** (never 404, never data), as the PDF requires.
-- The frontend hides things for UX **only**; it must never be the sole guard, and must render the 403 page gracefully.
-- Department is **derived from category on the server**. The client never sends `departmentId` on create.
+- Access JWT lifetime **900 s**, held in **memory only** on the client.
+- Refresh token: opaque, random, **stored hashed**, **single-use rotation**, 7-day sliding expiry, **30-day family cap**. Reuse of a rotated token **revokes the entire family** (`RefreshReused`).
+- Mobile stores the refresh token in the OS secure store (Keystore) and sends it in the request body. (A future web client would use the same-origin HttpOnly cookie variant; not in scope.)
+- Client uses **single-flight refresh**: on 401 `TokenExpired`, one refresh runs, parallel requests wait and retry once. Failed refresh → sign out.
+- `logout` revokes the family and returns 204 even without a token.
 
-## 5. Handoffs (agent ↔ agent communication)
+### Authorization is server-side (graded)
 
-Agents don't share memory. They communicate via files:
+- Scope: `Student` → own complaints; `DepartmentAdmin` → own department (from the server-held user record, not a client value); `SuperAdmin` → all, **read-only** (cannot change status).
+- Out-of-scope direct access → **403**, never the data. Department is derived from the category on the server.
+- The app hides UI by role for UX only and must render 403 gracefully.
 
-- `docs/HANDOFF.md` — append-only log. Newest entry on top. Format:
+## 5. Handoffs
 
-  ```
-  ### 2026-11-19 10:42 · Claude → Codex · BLOCKING|FYI
-  What I need / what changed / how to verify.
-  ```
-- `BLOCKING` items must be answered before the sender proceeds past the dependency; mock around it in the meantime.
-- Each agent reads the top of `docs/HANDOFF.md` and `git log --oneline -20` at the start of every session.
+`docs/HANDOFF.md`, append-only, newest on top: `### YYYY-MM-DD HH:MM · From → To · BLOCKING|FYI`. Both agents read the top of it and `git log --oneline -20` at session start. Only the owner edits other docs; agents append to HANDOFF.
 
-## 6. Parallel-work enablers (so nobody waits)
+## 6. Parallel work enablers
 
-- **Frontend can start immediately** against a mock: `npm run mock` runs Prism on `contract/openapi.yaml` at `:4010`. Set `VITE_API_URL=http://localhost:4010/api/v1`.
-- **Backend seeds** deterministic demo data (`npm run db:seed`): see `docs/ARCHITECTURE.md §Seed`. Frontend may rely on those credentials in demos.
-- Shared demo credentials (seeded, password for all: `Campus@123`):
+- `npm run mock` equivalent: `npx @stoplight/prism-cli mock contract/openapi.yaml -p 4010` — Codex can build the app before the API exists.
+- The Dart client is **generated** from the spec (`openapi-generator-cli generate -g dart-dio`); never hand-write DTOs.
+- Backend exposes Swagger UI at `/swagger` in Development; a contract test fails if routes/DTOs drift from `openapi.yaml`.
+- **Credentials policy:** no admin password is committed. Development seeding reads passwords from `dotnet user-secrets` / env (`SEED_ADMIN_PASSWORD`); a dev-only seeder runs only when `ASPNETCORE_ENVIRONMENT=Development`. Production admins are created by a one-off CLI command with externally supplied passwords (`dotnet CampusConnect.Api.dll seed-admins`). Demo accounts: `super@`, `cafeteria@`, `library@`, `labit@`, `academic@`, `student@` + `campusconnect.edu`.
 
-  | Role | Email |
-  |---|---|
-  | Super Admin | `super@campusconnect.edu` |
-  | Cafeteria Admin | `cafeteria@campusconnect.edu` |
-  | Library Admin | `library@campusconnect.edu` |
-  | Lab/IT Admin | `labit@campusconnect.edu` |
-  | Academic Admin | `academic@campusconnect.edu` |
-  | Student | `student@campusconnect.edu` |
+## 7. Definition of done
 
-## 7. Definition of done (per feature)
-
-- [ ] Spec updated first (if API surface changed) and merged
-- [ ] Implemented on **one** side, typed, linted, builds
-- [ ] Tests: backend → integration test incl. a **forbidden-access** case; frontend → at least a render/happy-path test for key screens
+- [ ] Spec updated and merged first (if the API surface changed)
+- [ ] Implemented in the owner's area; builds; analyzers/format clean
+- [ ] Tests: each endpoint has a happy path **and** a forbidden-scope test; state machine + rowVersion + refresh replay covered
 - [ ] Works against the other side's real or mock server
-- [ ] Deployed preview not broken (`/api/v1/health` green; FE loads)
+- [ ] `/health` green after deploy
 
 ## 8. Competition clock
 
-Hard deadline **3:00 PM** deployed. Milestones are in `docs/ROADMAP.md`. At **2:00 PM** feature freeze: only bug fixes, deploy, demo script, README. Anything unfinished is cut, not rushed.
+Hard deadline **3:00 PM**, deployed. **2:00 PM feature freeze.** Gates: P0 → Session → G1 → G2 → G3 → G4. Unfinished gates are cut, never rushed. Detailed schedule: `docs/ROADMAP.md`.
 
 ## 9. Disputes
 
-If the two agents disagree on an interface, the human decides. Until then, the spec on `main` stands.
+The owner decides. Until then, `main` stands.

@@ -1,85 +1,69 @@
-# CLAUDE.md — Frontend agent (Claude)
+# CLAUDE.md — Claude: core backend & migrations
 
-You are the **frontend engineer** for **CampusConnect**, a Smart Campus Complaint & Feedback Management System (BIIT Software Engineering Society competition; 5 hours; must be deployed by 3:00 PM). Codex is the backend engineer in the same repo.
+You are the **backend core engineer** for **CampusConnect** (Smart Campus Complaint & Feedback Management System; 5-hour competition, deployed by 3:00 PM). Codex writes tests and the mobile client. The owner (human) is the integrator.
 
-**Read first, every session:** `CONTRACT.md` → `contract/openapi.yaml` → top of `docs/HANDOFF.md` → `docs/ARCHITECTURE.md`. Requirements source: `docs/CampusConnect_Competition_Problem_Statement.pdf`.
+**Read first, every session:** `CONTRACT.md` → `contract/openapi.yaml` → `docs/ARCHITECTURE.md` → top of `docs/HANDOFF.md`. Requirements: `docs/CampusConnect_Competition_Problem_Statement.pdf`.
 
 ## Your territory
 
-- You edit **only** `frontend/**` (plus appending to `docs/HANDOFF.md`).
-- You never edit `backend/**`. Need an endpoint/field? Open a `contract/` PR or write a handoff to Codex (see CONTRACT.md §2, §5).
-- You never hand-write API types. Run `npm run gen:api` after any contract change.
+- You edit **`backend/src/**`** and **own all EF Core migrations** (you are the *only* migration author).
+- You do **not** edit `backend/tests/**`, `mobile/**`, `contract/**`, `docs/**` (except appending to `docs/HANDOFF.md`). Propose contract/doc changes via PR to the owner.
+- Codex will report API defects as failing tests + handoffs. Fix them in `src`.
 
-## Stack (decided — don't re-litigate)
+## Stack (decided)
 
-- **Vite + React 18 + TypeScript (strict)** — SPA; fastest to build and deploy on Vercel.
-- **React Router v6** (route guards by role), **TanStack Query** (server state), **React Hook Form + Zod** (forms)
-- **Tailwind CSS + shadcn/ui** (Radix primitives) — accessible components quickly
-- **Recharts** — bar (by dept), donut (by status), line (trend)
-- **openapi-typescript + openapi-fetch** — typed client from the contract
-- **Vitest + Testing Library**, **MSW** optional; **Prism** mock server for contract-first dev
-- Deploy: **Vercel** (`frontend/` root, `VITE_API_URL` env). SPA rewrite to `index.html`.
+- **.NET 10 · ASP.NET Core Web API (controllers or minimal APIs, be consistent) · C# nullable enabled, warnings as errors**
+- **EF Core 10 + SQL Server** (AWS RDS for SQL Server Express/Standard in prod; Docker `mcr.microsoft.com/mssql/server` locally)
+- **ASP.NET Core Identity** (users/roles/password hashing) + **JWT bearer**; own `RefreshToken` table (hashed, rotating, family-based)
+- **FluentValidation** for DTO validation → RFC 7807 `ValidationProblemDetails` (400)
+- **AWSSDK.S3** for pre-signed attachment URLs · **Serilog** logging · **AspNetCore.RateLimiting** on `/api/auth/*`
+- Hosting: **EC2 (Ubuntu) + Nginx reverse proxy → Kestrel**, systemd service; DB on **RDS**. See `docs/DEPLOYMENT.md`.
 
-## Commands (run from `frontend/`)
-
-```
-npm run dev        # Vite on :5173
-npm run mock       # Prism mock of contract on :4010
-npm run gen:api    # regenerate src/api/schema.d.ts from ../contract/openapi.yaml
-npm run typecheck && npm run lint && npm run test && npm run build
-```
-
-## Structure
+## Layout
 
 ```
-frontend/src/
-  api/          client.ts (openapi-fetch + auth header + 401 handler), schema.d.ts (GENERATED, do not edit)
-  auth/         AuthProvider, useAuth, RequireRole, token in localStorage
-  routes/       student/, admin/ (dept + super share screens, scope differs), auth/, errors/
-  components/   ui/ (shadcn), StatusBadge, PriorityBadge, ComplaintCard, Timeline, ChartCard, EmptyState
-  features/     complaints/, analytics/, notifications/  (hooks + components per feature)
-  lib/          format.ts, cn.ts
+backend/
+  CampusConnect.sln
+  src/CampusConnect.Api/   Program.cs, Controllers|Endpoints/, Auth/, Domain/, Data/(DbContext, Migrations/, Seed/), Services/, Dtos/
+  tests/                   (Codex's — do not edit)
 ```
+Keep Domain / Data / Api as folders (or projects) — don't over-engineer for 5 hours.
 
-## Screens to build (MVP first, then stretch)
+## Data model (EF Core, SQL Server)
 
-**MVP (must ship by ~12:30 PM)**
-1. Login / Register (student only register; link text "Admins are provisioned by the university")
-2. Student: **Submit complaint** (category cards → sub-issue chips → title/description/priority/location/images), **My complaints** (status filter), **Complaint detail** with timeline + dept remarks
-3. Dept admin: **Inbox** (own dept only), **Complaint detail** with status actions + remark box (remark required for RESOLVED/REJECTED), **Dept dashboard** (KPI cards + charts)
-4. Super admin: **All complaints** (search + filters category/department/status), **Global dashboard** (KPIs + bar chart by department + donut by status), detail view
-5. 403 page, 404 page, session-expired redirect
+`Departments(int)` · `Categories(int, DepartmentId FK)` · `AspNetUsers(Guid)` with `Name, StudentId?, DepartmentId?` · `Complaints(bigint, Ticket unique, StudentId, CategoryId, DepartmentId, Title, Description, Location?, Status, CreatedAt, UpdatedAt, ResolvedAt?, RowVersion [Timestamp])` · `Remarks(bigint, ComplaintId, AuthorId, Body, CreatedAt)` · `ComplaintAttachments(bigint, ComplaintId, ObjectKey)` · `RefreshTokens(bigint, UserId, FamilyId, TokenHash, ExpiresAt, FamilyExpiresAt, ReplacedByHash?, RevokedAt?, CreatedAt)`.
+Optional gates (separate later migrations, never required for P0): `ComplaintHistory`, `Notifications`, `Feedback`.
+Indexes: `Complaints(DepartmentId, Status)`, `Complaints(StudentId)`, `Complaints(CategoryId)`, `Complaints(CreatedAt)`.
+Seed lookup data (4 departments, 4 categories w/ issue examples) in a migration/`HasData`; **never seed passwords in code.**
 
-**Stretch (only after MVP deployed & verified)** — "me too" support button + counts, overdue (SLA) badge, in-app notification bell (poll 30 s), resolution rating (1–5), trend line chart, recurring-issues panel, CSV export button, anonymous-to-staff toggle, dark mode, mobile-first polish.
+## Non-negotiables (graded)
 
-## Rules of the road
+1. **Server-side authorization.** All complaint reads/writes go through one `ComplaintScope` helper:
+   Student → `StudentId == userId`; DepartmentAdmin → `DepartmentId == user.DepartmentId` (loaded from DB/claim set by the server); SuperAdmin → all but **read-only**.
+   Never take a department from the client. Single-resource out-of-scope → **403**, not 404, no data.
+   Use `[Authorize(Roles=…)]` on controllers **and** scope in the service layer.
+2. **Routing:** `DepartmentId = Category.DepartmentId` on create.
+3. **State machine:** Pending→InProgress|Resolved|Rejected; InProgress→Resolved|Rejected; terminal after. Illegal → 409 `InvalidTransition`. Rejected requires `remark` (400). Compute `allowedTransitions` per caller.
+4. **Concurrency:** `rowVersion` required on status update; `DbUpdateConcurrencyException` → 409 `StaleRowVersion`.
+5. **Session model** exactly as in `CONTRACT.md §4` — access 900 s, rotating hashed refresh, family revoke on replay, logout idempotent. Ship it all or nothing.
+6. Errors are RFC 7807 with the `code` values in the spec. Never leak stack traces/EF exceptions. Login failure message is generic. Rate-limit auth.
+7. Gate-dependent writes (history, notifications) are wrapped in the **same transaction** as the status change and only run when the gate is enabled (`/api/features`).
 
-- **Authorization is never frontend-only.** Hide nav items by role for UX, but assume the API can return 403 on any call; render the 403 screen, never crash. Never trust role from localStorage for anything but UI hints; call `/auth/me` on boot.
-- Use `allowedTransitions` from the detail response to render status actions — don't hardcode the state machine.
-- Do not send `departmentId` when creating complaints. Backend derives it from `category`.
-- Image upload flow: `POST /uploads/sign` → upload directly to returned URL → send `publicUrl`s in `imageUrls` (max 3, jpeg/png/webp, ≤5 MB — validate client-side too).
-- Every list/page handles **loading, empty, error** states. No blank screens.
-- Accessibility: labels on inputs, focus rings, colour is never the only status signal (badge has text + icon).
-- Keep components small; co-locate hooks. No `any`. No unused deps. No giant files (>250 lines → split).
-- Status colours (consistent everywhere): PENDING amber · IN_PROGRESS blue · RESOLVED green · REJECTED red.
-- Env: `VITE_API_URL` only. Never commit secrets.
+## Commands
 
-## Workflow
+```
+dotnet restore && dotnet build -warnaserror
+dotnet run --project backend/src/CampusConnect.Api        # :5080
+dotnet ef migrations add <Name> -p backend/src/CampusConnect.Api
+dotnet ef database update -p backend/src/CampusConnect.Api
+dotnet format --verify-no-changes
+```
+Env/config (`appsettings.json` + env vars, no secrets committed): `ConnectionStrings__Default`, `Jwt__Key`, `Jwt__Issuer`, `Jwt__Audience`, `Features__History|Notifications|Feedback|Export|Attachments`, `Aws__Region`, `Aws__S3Bucket`, `SEED_ADMIN_PASSWORD` (dev only).
 
-1. Pull `main`, read `docs/HANDOFF.md` top.
-2. If the API must change → contract PR first (CONTRACT.md §2). Otherwise build against `npm run mock`, then switch to real API.
-3. Branch `fe/<feature>`; Conventional Commits `feat(fe): …`; one-side-only PRs.
-4. Before PR: typecheck, lint, test, build all green.
-5. Finished something Codex needs to know about (e.g. new mock needs, a bug in the API)? Append to `docs/HANDOFF.md`.
+## Order of work
 
-## Demo-readiness checklist (for the judges)
+P0: solution + DbContext + migration + lookup seed → Identity + register/login/me → categories → complaints create/list/detail with scope → department list/detail/status/remarks/dashboard → admin list/detail/dashboard/reports → `/health` → **deploy to AWS** → Session (refresh/logout) → G1 history → G2 notifications → G3 feedback → G4 export, attachments.
 
-- [ ] Log in as each seeded role (see CONTRACT.md §6) and each sees only their scope
-- [ ] Library admin pasting a Lab/IT complaint URL → clean 403 screen (this is explicitly graded)
-- [ ] Charts render with seeded data; empty-state when none
-- [ ] Mobile viewport usable
-- [ ] Production build points at deployed API; no console errors
+## Handoff
 
-## Out of scope for you
-
-DB schema, auth logic, seeding, deployment of the API, secrets management → Codex. If it's in `/backend`, don't touch it.
+After each milestone append to `docs/HANDOFF.md`: base URL, what's live, seeded demo accounts, known gaps. Reply to Codex's BLOCKING items first.

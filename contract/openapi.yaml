@@ -1,68 +1,88 @@
 openapi: 3.1.0
 info:
   title: CampusConnect API
-  version: 1.0.0
+  version: 2.0.0
   description: |
-    SINGLE SOURCE OF TRUTH for the frontend <-> backend boundary.
-    Frontend (Claude) generates types from this file; backend (Codex) implements it.
-    Change rules live in /CONTRACT.md. Never edit this file in a feature PR that also
-    changes app code - contract changes go in their own `contract:` PR first.
+    SINGLE SOURCE OF TRUTH for the mobile app <-> ASP.NET Core API boundary.
+    Baseline: .NET 10 / EF Core 10 / SQL Server, hosted on AWS. See /CONTRACT.md for change rules.
+
+    Conventions
+    - Base path `/api`. Wire values are PascalCase enums (`Student`, `InProgress`).
+    - Errors are RFC 7807 `application/problem+json`. Validation failures are 400.
+    - Lists: `{ items, pageNumber, pageSize, totalCount }`.
+    - IDs: users = GUID string; lookup tables (department, category) = int32; complaints = int64.
+    - Authorization is enforced server-side. Out-of-scope access returns 403, never data.
+
+    Delivery gates (see docs/ARCHITECTURE.md): operations tagged `P0` are mandatory,
+    `Session` = refresh-token flow, `G1`..`G4` are optional features that may return 501
+    until enabled. The mobile client must feature-detect via `GET /api/features`.
 servers:
-  - url: http://localhost:4000/api/v1
-    description: Local
-  - url: https://campusconnect-api.onrender.com/api/v1
-    description: Production (update after deploy)
+  - url: http://localhost:5080
+    description: Local (dotnet run)
+  - url: https://api.campusconnect.example.com
+    description: Production on AWS (replace after deploy)
 
 security:
   - bearerAuth: []
 
 tags:
-  - name: Auth
-  - name: Complaints
-  - name: Admin
-  - name: Analytics
-  - name: Meta
+  - { name: Auth, description: P0 + Session }
+  - { name: Student, description: P0 }
+  - { name: Department, description: P0 - DepartmentAdmin scope }
+  - { name: Admin, description: P0 - SuperAdmin scope (read-only by default) }
+  - { name: Meta, description: P0 }
+  - { name: Optional, description: G1-G4 }
 
 paths:
   /health:
     get:
       tags: [Meta]
       security: []
-      summary: Liveness probe
+      summary: Liveness + DB reachability (load balancer / Nginx health check)
       responses:
         "200":
-          description: OK
+          description: Healthy
           content:
             application/json:
               schema:
                 type: object
                 required: [status]
                 properties:
-                  status: { type: string, enum: [ok] }
+                  status: { type: string, enum: [Healthy] }
+        "503": { description: Database unreachable }
 
-  /meta/categories:
+  /api/features:
     get:
       tags: [Meta]
       security: []
+      summary: Which optional gates are enabled on this deployment
+      responses:
+        "200":
+          description: Feature flags
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Features" }
+
+  /api/categories:
+    get:
+      tags: [Meta]
       summary: Categories with their responsible department (drives the submit form)
       responses:
         "200":
-          description: List of categories
+          description: Categories
           content:
             application/json:
               schema:
-                type: object
-                required: [data]
-                properties:
-                  data:
-                    type: array
-                    items: { $ref: "#/components/schemas/Category" }
+                type: array
+                items: { $ref: "#/components/schemas/Category" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
 
-  /auth/register:
+  # ---------------- Auth ----------------
+  /api/auth/register:
     post:
       tags: [Auth]
       security: []
-      summary: Student self-registration (admins are seeded, never registered)
+      summary: Student self-registration. Admins are provisioned, never registered.
       requestBody:
         required: true
         content:
@@ -70,18 +90,18 @@ paths:
             schema: { $ref: "#/components/schemas/RegisterRequest" }
       responses:
         "201":
-          description: Registered and logged in
+          description: Registered and signed in
           content:
             application/json:
               schema: { $ref: "#/components/schemas/AuthResponse" }
+        "400": { $ref: "#/components/responses/ValidationProblem" }
         "409": { $ref: "#/components/responses/Conflict" }
-        "422": { $ref: "#/components/responses/ValidationError" }
 
-  /auth/login:
+  /api/auth/login:
     post:
       tags: [Auth]
       security: []
-      summary: Login for any role
+      summary: Sign in (any role). Generic failure message; rate limited.
       requestBody:
         required: true
         content:
@@ -89,57 +109,64 @@ paths:
             schema: { $ref: "#/components/schemas/LoginRequest" }
       responses:
         "200":
-          description: Logged in
+          description: Signed in
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "400": { $ref: "#/components/responses/ValidationProblem" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { description: Too many attempts }
+
+  /api/auth/refresh:
+    post:
+      tags: [Auth]
+      security: []
+      summary: |
+        Exchange a refresh token for a new access token + a NEW refresh token (rotation).
+        Re-using an already-rotated token revokes the whole token family (replay detection).
+        Mobile clients keep the refresh token in secure storage and send it in the body.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RefreshRequest" }
+      responses:
+        "200":
+          description: Rotated
           content:
             application/json:
               schema: { $ref: "#/components/schemas/AuthResponse" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
-  /auth/me:
+  /api/auth/logout:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Revoke the refresh-token family. Succeeds (204) even if the token is missing/unknown.
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RefreshRequest" }
+      responses:
+        "204": { description: Signed out }
+
+  /api/auth/me:
     get:
       tags: [Auth]
-      summary: Current user (used to rehydrate session)
+      summary: Current user (rehydrate session on app start)
       responses:
         "200":
           description: Current user
           content:
             application/json:
-              schema:
-                type: object
-                required: [data]
-                properties:
-                  data: { $ref: "#/components/schemas/User" }
+              schema: { $ref: "#/components/schemas/User" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
-  /uploads/sign:
+  # ---------------- Student ----------------
+  /api/complaints:
     post:
-      tags: [Complaints]
-      summary: Get a signed upload (Cloudinary) for a complaint image. Student only.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [contentType]
-              properties:
-                contentType: { type: string, enum: [image/jpeg, image/png, image/webp] }
-      responses:
-        "200":
-          description: Signed upload params
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [data]
-                properties:
-                  data: { $ref: "#/components/schemas/SignedUpload" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-
-  /complaints:
-    post:
-      tags: [Complaints]
-      summary: Student submits a complaint. Department is derived server-side from category.
+      tags: [Student]
+      summary: Student submits a complaint. DepartmentId is derived server-side from categoryId.
       requestBody:
         required: true
         content:
@@ -148,89 +175,134 @@ paths:
       responses:
         "201":
           description: Created
+          headers:
+            Location: { schema: { type: string } }
           content:
             application/json:
-              schema:
-                type: object
-                required: [data]
-                properties:
-                  data: { $ref: "#/components/schemas/Complaint" }
+              schema: { $ref: "#/components/schemas/Complaint" }
+        "400": { $ref: "#/components/responses/ValidationProblem" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "422": { $ref: "#/components/responses/ValidationError" }
     get:
-      tags: [Complaints]
-      summary: |
-        Role-scoped list. STUDENT -> own only. DEPT_ADMIN -> own department only.
-        SUPER_ADMIN -> everything. Scope is enforced server-side; query filters narrow within scope.
+      tags: [Student]
+      summary: My complaints only (Student role). Newest first.
       parameters:
-        - { name: status, in: query, schema: { $ref: "#/components/schemas/ComplaintStatus" } }
-        - { name: category, in: query, schema: { $ref: "#/components/schemas/CategoryKey" } }
-        - { name: departmentId, in: query, description: "Ignored for DEPT_ADMIN / STUDENT", schema: { type: string } }
-        - { name: priority, in: query, schema: { $ref: "#/components/schemas/Priority" } }
-        - { name: overdue, in: query, schema: { type: boolean } }
-        - { name: q, in: query, description: Text search over title/description/ticket, schema: { type: string } }
-        - { name: sort, in: query, schema: { type: string, enum: [newest, oldest, mostSupported, priority], default: newest } }
-        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
-        - { name: pageSize, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { $ref: "#/components/parameters/Status" }
+        - { $ref: "#/components/parameters/PageNumber" }
+        - { $ref: "#/components/parameters/PageSize" }
       responses:
         "200":
-          description: Paged complaints
+          description: Paged list
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ComplaintPage" }
+        "403": { $ref: "#/components/responses/Forbidden" }
 
-  /complaints/{id}:
+  /api/complaints/{id}:
     parameters:
-      - { name: id, in: path, required: true, schema: { type: string } }
+      - { $ref: "#/components/parameters/ComplaintId" }
     get:
-      tags: [Complaints]
-      summary: Complaint detail incl. timeline. 403 if outside the caller's scope (direct-URL protection).
+      tags: [Student]
+      summary: My complaint detail incl. responses/remarks. 403 if it is not mine.
       responses:
         "200":
           description: Detail
           content:
             application/json:
-              schema:
-                type: object
-                required: [data]
-                properties:
-                  data: { $ref: "#/components/schemas/ComplaintDetail" }
+              schema: { $ref: "#/components/schemas/ComplaintDetail" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
 
-  /complaints/{id}/status:
-    patch:
-      tags: [Admin]
-      summary: Dept admin (own dept) or super admin changes status. REJECTED and RESOLVED require a reason/remark.
+  /api/uploads/presign:
+    post:
+      tags: [Student]
+      summary: |
+        (Optional attachments) Get a pre-signed S3 PUT URL for one image.
+        Upload bytes directly to S3, then send `objectKey` in CreateComplaintRequest.attachmentKeys.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [contentType, sizeBytes]
+              properties:
+                contentType: { type: string, enum: [image/jpeg, image/png, image/webp] }
+                sizeBytes: { type: integer, minimum: 1, maximum: 5242880 }
+      responses:
+        "200":
+          description: Presigned upload
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PresignedUpload" }
+        "400": { $ref: "#/components/responses/ValidationProblem" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "501": { description: Attachments disabled on this deployment }
+
+  # ---------------- Department admin ----------------
+  /api/department/complaints:
+    get:
+      tags: [Department]
+      summary: Complaints of the caller's own department ONLY (current and past). DepartmentAdmin role.
+      parameters:
+        - { $ref: "#/components/parameters/Status" }
+        - { $ref: "#/components/parameters/Search" }
+        - { $ref: "#/components/parameters/PageNumber" }
+        - { $ref: "#/components/parameters/PageSize" }
+      responses:
+        "200":
+          description: Paged list
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ComplaintPage" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/department/complaints/{id}:
+    parameters:
+      - { $ref: "#/components/parameters/ComplaintId" }
+    get:
+      tags: [Department]
+      summary: Detail. 403 if the complaint belongs to another department (direct-URL protection).
+      responses:
+        "200":
+          description: Detail
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ComplaintDetail" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/department/complaints/{id}/status:
+    put:
+      tags: [Department]
+      summary: |
+        Update status with optimistic concurrency. Allowed:
+        Pending -> InProgress | Resolved | Rejected; InProgress -> Resolved | Rejected.
+        Resolved and Rejected are terminal. Rejected requires `remark`.
+        Stale `rowVersion` -> 409.
+      parameters:
+        - { $ref: "#/components/parameters/ComplaintId" }
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: "#/components/schemas/UpdateStatusRequest" }
-      parameters:
-        - { name: id, in: path, required: true, schema: { type: string } }
       responses:
         "200":
           description: Updated
           content:
             application/json:
-              schema:
-                type: object
-                required: [data]
-                properties:
-                  data: { $ref: "#/components/schemas/ComplaintDetail" }
+              schema: { $ref: "#/components/schemas/ComplaintDetail" }
+        "400": { $ref: "#/components/responses/ValidationProblem" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
-        "422": { $ref: "#/components/responses/ValidationError" }
 
-  /complaints/{id}/comments:
+  /api/department/complaints/{id}/remarks:
     post:
-      tags: [Complaints]
-      summary: |
-        Add a message to the thread. Admin remarks are visible to the student.
-        Students may reply only on their own complaint.
+      tags: [Department]
+      summary: Add a remark/response visible to the student without changing status.
       parameters:
-        - { name: id, in: path, required: true, schema: { type: string } }
+        - { $ref: "#/components/parameters/ComplaintId" }
       requestBody:
         required: true
         content:
@@ -242,47 +314,162 @@ paths:
                 body: { type: string, minLength: 1, maxLength: 2000 }
       responses:
         "201":
-          description: Created
+          description: Added
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ComplaintDetail" }
+        "400": { $ref: "#/components/responses/ValidationProblem" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/department/dashboard:
+    get:
+      tags: [Department]
+      summary: KPI counts for the caller's own department
+      responses:
+        "200":
+          description: Summary
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DashboardSummary" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  # ---------------- Super admin ----------------
+  /api/admin/complaints:
+    get:
+      tags: [Admin]
+      summary: All complaints across departments. SuperAdmin role. Read-only by default.
+      parameters:
+        - { $ref: "#/components/parameters/Status" }
+        - { name: categoryId, in: query, schema: { type: integer } }
+        - { name: departmentId, in: query, schema: { type: integer } }
+        - { $ref: "#/components/parameters/Search" }
+        - { $ref: "#/components/parameters/PageNumber" }
+        - { $ref: "#/components/parameters/PageSize" }
+      responses:
+        "200":
+          description: Paged list
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ComplaintPage" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/complaints/{id}:
+    parameters:
+      - { $ref: "#/components/parameters/ComplaintId" }
+    get:
+      tags: [Admin]
+      summary: Any complaint's detail (SuperAdmin)
+      responses:
+        "200":
+          description: Detail
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ComplaintDetail" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/admin/dashboard:
+    get:
+      tags: [Admin]
+      summary: System-wide KPI counts
+      responses:
+        "200":
+          description: Summary
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DashboardSummary" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/reports/by-department:
+    get:
+      tags: [Admin]
+      summary: Bar chart - complaints received per department
+      responses:
+        "200":
+          description: Series
           content:
             application/json:
               schema:
-                type: object
-                required: [data]
-                properties:
-                  data: { $ref: "#/components/schemas/TimelineEntry" }
+                type: array
+                items: { $ref: "#/components/schemas/DepartmentCount" }
         "403": { $ref: "#/components/responses/Forbidden" }
 
-  /complaints/{id}/support:
-    put:
-      tags: [Complaints]
-      summary: Student "me too" - idempotent toggle ON. Cannot support own complaint.
-      parameters:
-        - { name: id, in: path, required: true, schema: { type: string } }
+  /api/admin/reports/by-status:
+    get:
+      tags: [Admin]
+      summary: Donut chart - complaints per status
       responses:
         "200":
-          description: New support state
+          description: Series
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/SupportState" }
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/StatusCount" }
         "403": { $ref: "#/components/responses/Forbidden" }
-    delete:
-      tags: [Complaints]
-      summary: Remove my "me too"
-      parameters:
-        - { name: id, in: path, required: true, schema: { type: string } }
+
+  /api/admin/reports/recurring:
+    get:
+      tags: [Admin]
+      summary: Most frequent issue categories (recurring problems), top 10
       responses:
         "200":
-          description: New support state
+          description: Series
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/SupportState" }
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/CategoryCount" }
+        "403": { $ref: "#/components/responses/Forbidden" }
 
-  /complaints/{id}/feedback:
+  # ---------------- Optional gates ----------------
+  /api/complaints/{id}/history:
+    get:
+      tags: [Optional]
+      summary: "G1 - Audit timeline (status changes and remarks). Same scope rules as detail."
+      parameters:
+        - { $ref: "#/components/parameters/ComplaintId" }
+      responses:
+        "200":
+          description: Timeline, oldest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/HistoryEntry" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "501": { description: Gate disabled }
+
+  /api/notifications:
+    get:
+      tags: [Optional]
+      summary: "G2 - Persisted notifications for the caller. Mobile polls every 30s (SignalR is a later option)."
+      parameters:
+        - { $ref: "#/components/parameters/PageNumber" }
+        - { $ref: "#/components/parameters/PageSize" }
+      responses:
+        "200":
+          description: Paged notifications
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NotificationPage" }
+        "501": { description: Gate disabled }
+
+  /api/notifications/read-all:
     post:
-      tags: [Complaints]
-      summary: Owner rates a RESOLVED complaint (1-5). One per complaint.
+      tags: [Optional]
+      summary: G2 - Mark all read
+      responses:
+        "204": { description: Done }
+        "501": { description: Gate disabled }
+
+  /api/complaints/{id}/feedback:
+    post:
+      tags: [Optional]
+      summary: "G3 - Owner rates a Resolved complaint 1-5, once."
       parameters:
-        - { name: id, in: path, required: true, schema: { type: string } }
+        - { $ref: "#/components/parameters/ComplaintId" }
       requestBody:
         required: true
         content:
@@ -294,148 +481,24 @@ paths:
                 rating: { type: integer, minimum: 1, maximum: 5 }
                 comment: { type: string, maxLength: 500 }
       responses:
-        "201":
-          description: Saved
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [data]
-                properties:
-                  data: { $ref: "#/components/schemas/ComplaintDetail" }
+        "201": { description: Saved }
+        "400": { $ref: "#/components/responses/ValidationProblem" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "501": { description: Gate disabled }
 
-  /notifications:
+  /api/admin/complaints/export:
     get:
-      tags: [Complaints]
-      summary: In-app notifications for the caller (status change, new remark). Poll every 30s.
-      parameters:
-        - { name: unreadOnly, in: query, schema: { type: boolean, default: false } }
+      tags: [Optional]
+      summary: "G4 - CSV export of the caller's scope (SuperAdmin: all; DepartmentAdmin: own department via same filters)"
       responses:
         "200":
-          description: Notifications, newest first
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [data, unreadCount]
-                properties:
-                  data:
-                    type: array
-                    items: { $ref: "#/components/schemas/Notification" }
-                  unreadCount: { type: integer }
-
-  /notifications/read-all:
-    post:
-      tags: [Complaints]
-      summary: Mark all my notifications read
-      responses:
-        "204": { description: Done }
-
-  /analytics/summary:
-    get:
-      tags: [Analytics]
-      summary: |
-        KPI counts. SUPER_ADMIN -> system-wide (optional departmentId).
-        DEPT_ADMIN -> own department only. STUDENT -> 403.
-      parameters:
-        - { name: departmentId, in: query, schema: { type: string } }
-      responses:
-        "200":
-          description: Summary
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [data]
-                properties:
-                  data: { $ref: "#/components/schemas/Summary" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-
-  /analytics/by-department:
-    get:
-      tags: [Analytics]
-      summary: Bar chart - complaints per department. SUPER_ADMIN only (dept admins get only their own row).
-      responses:
-        "200":
-          description: Series
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [data]
-                properties:
-                  data:
-                    type: array
-                    items: { $ref: "#/components/schemas/DepartmentCount" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-
-  /analytics/by-status:
-    get:
-      tags: [Analytics]
-      summary: Pie/donut - complaints per status (scoped by role)
-      responses:
-        "200":
-          description: Series
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [data]
-                properties:
-                  data:
-                    type: array
-                    items: { $ref: "#/components/schemas/StatusCount" }
-
-  /analytics/trend:
-    get:
-      tags: [Analytics]
-      summary: Line chart - complaints created per day (scoped by role)
-      parameters:
-        - { name: days, in: query, schema: { type: integer, minimum: 1, maximum: 90, default: 14 } }
-      responses:
-        "200":
-          description: Series
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [data]
-                properties:
-                  data:
-                    type: array
-                    items: { $ref: "#/components/schemas/TrendPoint" }
-
-  /analytics/recurring:
-    get:
-      tags: [Analytics]
-      summary: Recurring issues - top issue clusters by support count + volume (admins only)
-      responses:
-        "200":
-          description: Top recurring issues
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [data]
-                properties:
-                  data:
-                    type: array
-                    items: { $ref: "#/components/schemas/RecurringIssue" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-
-  /admin/complaints/export.csv:
-    get:
-      tags: [Admin]
-      summary: CSV export of the caller's scoped complaints (honours the same filters as GET /complaints)
-      responses:
-        "200":
-          description: CSV file
+          description: CSV
           content:
             text/csv:
               schema: { type: string }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "501": { description: Gate disabled }
 
 components:
   securitySchemes:
@@ -443,92 +506,121 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
+      description: Access token, 900 s lifetime. Claims include `sub` (user GUID), `role`, and `dept` (department int id, DepartmentAdmin only).
+
+  parameters:
+    ComplaintId:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+    Status:
+      name: status
+      in: query
+      schema: { $ref: "#/components/schemas/ComplaintStatus" }
+    Search:
+      name: q
+      in: query
+      description: Text search over ticket, title and description
+      schema: { type: string, maxLength: 100 }
+    PageNumber:
+      name: pageNumber
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSize:
+      name: pageSize
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
 
   responses:
+    ValidationProblem:
+      description: Invalid input (RFC 7807 with `errors`)
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/ValidationProblemDetails" }
     Unauthorized:
-      description: Missing/invalid token
+      description: Missing/invalid/expired credentials
       content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/ProblemDetails" }
     Forbidden:
-      description: Authenticated but outside role/department scope
+      description: Authenticated but outside role/department/ownership scope
       content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/ProblemDetails" }
     NotFound:
-      description: Not found
+      description: Resource does not exist
       content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/ProblemDetails" }
     Conflict:
-      description: State conflict (duplicate, invalid transition)
+      description: Duplicate, invalid status transition, or stale rowVersion
       content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
-    ValidationError:
-      description: Body/query failed validation
-      content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/ProblemDetails" }
 
   schemas:
-    Error:
+    ProblemDetails:
       type: object
-      required: [error]
+      required: [status, title]
       properties:
-        error:
-          type: object
-          required: [code, message]
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        traceId: { type: string }
+        code:
+          type: string
+          description: Stable machine-readable reason for client branching
+          enum: [InvalidCredentials, TokenExpired, RefreshReused, OutOfScope, InvalidTransition, StaleRowVersion, DuplicateEmail, GateDisabled]
+
+    ValidationProblemDetails:
+      allOf:
+        - $ref: "#/components/schemas/ProblemDetails"
+        - type: object
+          required: [errors]
           properties:
-            code:
-              type: string
-              enum: [UNAUTHORIZED, FORBIDDEN, NOT_FOUND, CONFLICT, VALIDATION_FAILED, INVALID_TRANSITION, INTERNAL]
-            message: { type: string }
-            fields:
+            errors:
               type: object
-              description: Field-level errors for VALIDATION_FAILED, keyed by field name
-              additionalProperties: { type: string }
+              additionalProperties:
+                type: array
+                items: { type: string }
 
     Role:
       type: string
-      enum: [STUDENT, DEPT_ADMIN, SUPER_ADMIN]
-
-    CategoryKey:
-      type: string
-      enum: [CAFETERIA, LIBRARY, LAB_IT, ACADEMIC]
+      enum: [Student, DepartmentAdmin, SuperAdmin]
 
     ComplaintStatus:
       type: string
-      description: |
-        Allowed transitions (enforced server-side):
-        PENDING -> IN_PROGRESS | REJECTED
-        IN_PROGRESS -> RESOLVED | REJECTED
-        RESOLVED / REJECTED are terminal (SUPER_ADMIN may reopen to IN_PROGRESS).
-      enum: [PENDING, IN_PROGRESS, RESOLVED, REJECTED]
+      enum: [Pending, InProgress, Resolved, Rejected]
 
-    Priority:
-      type: string
-      description: Chosen by student; super/dept admin may not change it (keeps audit simple).
-      enum: [LOW, MEDIUM, HIGH]
+    Features:
+      type: object
+      required: [history, notifications, feedback, export, attachments]
+      properties:
+        history: { type: boolean }
+        notifications: { type: boolean }
+        feedback: { type: boolean }
+        export: { type: boolean }
+        attachments: { type: boolean }
 
     Department:
       type: object
-      required: [id, name, slug]
+      required: [id, name]
       properties:
-        id: { type: string }
+        id: { type: integer }
         name: { type: string, example: Library Administration }
-        slug: { type: string, example: library }
 
     Category:
       type: object
-      required: [key, label, description, subIssues, department]
+      required: [id, name, description, issueExamples, department]
       properties:
-        key: { $ref: "#/components/schemas/CategoryKey" }
-        label: { type: string }
+        id: { type: integer }
+        name: { type: string, example: Laboratories & IT Facilities }
         description: { type: string }
-        subIssues:
+        issueExamples:
           type: array
-          description: Suggested issue types from the problem statement (e.g. "Poor food quality or hygiene")
+          description: Example issues from the problem statement, shown as hints on the submit form
           items: { type: string }
         department: { $ref: "#/components/schemas/Department" }
 
@@ -536,20 +628,22 @@ components:
       type: object
       required: [id, name, email, role]
       properties:
-        id: { type: string }
+        id: { type: string, format: uuid }
         name: { type: string }
         email: { type: string, format: email }
         role: { $ref: "#/components/schemas/Role" }
-        studentId: { type: [string, "null"], description: University roll/enrolment number (students only) }
-        department: { oneOf: [{ $ref: "#/components/schemas/Department" }, { type: "null" }], description: Set for DEPT_ADMIN }
+        studentId: { type: [string, "null"] }
+        department:
+          oneOf: [{ $ref: "#/components/schemas/Department" }, { type: "null" }]
+          description: Set for DepartmentAdmin
 
     RegisterRequest:
       type: object
       required: [name, email, password]
       properties:
         name: { type: string, minLength: 2, maxLength: 80 }
-        email: { type: string, format: email }
-        password: { type: string, minLength: 8, maxLength: 72 }
+        email: { type: string, format: email, maxLength: 256 }
+        password: { type: string, minLength: 8, maxLength: 100 }
         studentId: { type: string, maxLength: 30 }
 
     LoginRequest:
@@ -559,170 +653,144 @@ components:
         email: { type: string, format: email }
         password: { type: string }
 
+    RefreshRequest:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken: { type: string }
+
     AuthResponse:
       type: object
-      required: [token, user]
+      required: [accessToken, expiresIn, refreshToken, user]
       properties:
-        token: { type: string, description: "JWT, 7d expiry. Sent as Authorization: Bearer <token>" }
+        accessToken: { type: string, description: "JWT, kept in memory only" }
+        expiresIn: { type: integer, example: 900, description: Seconds }
+        refreshToken: { type: string, description: "Opaque, single-use, 7d sliding / 30d family cap; stored hashed server-side. Keep in secure storage." }
         user: { $ref: "#/components/schemas/User" }
 
-    SignedUpload:
+    PresignedUpload:
       type: object
-      required: [uploadUrl, fields, publicUrl]
+      required: [uploadUrl, objectKey, expiresIn]
       properties:
         uploadUrl: { type: string, format: uri }
-        fields: { type: object, additionalProperties: { type: string } }
-        publicUrl: { type: string, format: uri, description: Value to send back in CreateComplaintRequest.imageUrls }
+        objectKey: { type: string }
+        expiresIn: { type: integer, example: 300 }
 
     CreateComplaintRequest:
       type: object
-      required: [category, title, description]
+      required: [categoryId, title, description]
       properties:
-        category: { $ref: "#/components/schemas/CategoryKey" }
-        subIssue: { type: string, maxLength: 120, description: One of Category.subIssues or custom }
+        categoryId: { type: integer }
         title: { type: string, minLength: 5, maxLength: 120 }
         description: { type: string, minLength: 10, maxLength: 3000 }
-        priority: { $ref: "#/components/schemas/Priority" }
-        location: { type: string, maxLength: 120, description: e.g. "Lab 3, Block B" }
-        imageUrls:
+        location: { type: string, maxLength: 120 }
+        attachmentKeys:
           type: array
           maxItems: 3
-          items: { type: string, format: uri }
-        anonymousToStaff:
-          type: boolean
-          default: false
-          description: Hide student name from department admins (super admin still sees it)
+          items: { type: string }
 
     UpdateStatusRequest:
       type: object
-      required: [status]
+      required: [status, rowVersion]
       properties:
         status: { $ref: "#/components/schemas/ComplaintStatus" }
-        remark:
-          type: string
-          maxLength: 2000
-          description: REQUIRED when status is RESOLVED or REJECTED. Shown to the student.
+        remark: { type: string, maxLength: 2000, description: REQUIRED when status is Rejected; optional for Resolved/InProgress }
+        rowVersion: { type: string, description: "Opaque value from the last read of this complaint (base64)" }
+
+    Attachment:
+      type: object
+      required: [url]
+      properties:
+        url: { type: string, format: uri, description: Short-lived signed GET URL }
+
+    Remark:
+      type: object
+      required: [id, body, authorName, createdAt]
+      properties:
+        id: { type: integer, format: int64 }
+        body: { type: string }
+        authorName: { type: string }
+        createdAt: { type: string, format: date-time }
 
     Complaint:
       type: object
-      required: [id, ticket, title, category, department, status, priority, supportCount, createdAt, updatedAt, isOverdue]
+      required: [id, ticket, title, status, category, department, rowVersion, createdAt, updatedAt]
       properties:
-        id: { type: string }
-        ticket: { type: string, example: CC-2026-0042, description: Human-friendly reference }
+        id: { type: integer, format: int64 }
+        ticket: { type: string, example: CC-2026-000042 }
         title: { type: string }
-        description: { type: string }
-        category: { $ref: "#/components/schemas/CategoryKey" }
-        subIssue: { type: [string, "null"] }
-        department: { $ref: "#/components/schemas/Department" }
         status: { $ref: "#/components/schemas/ComplaintStatus" }
-        priority: { $ref: "#/components/schemas/Priority" }
+        category: { $ref: "#/components/schemas/CategorySummary" }
+        department: { $ref: "#/components/schemas/Department" }
         location: { type: [string, "null"] }
-        imageUrls: { type: array, items: { type: string, format: uri } }
-        supportCount: { type: integer, description: Number of "me too" supporters (excluding author) }
-        supportedByMe: { type: boolean }
-        isOverdue: { type: boolean, description: "Server-computed SLA flag: open longer than SLA for its priority (HIGH 24h, MEDIUM 72h, LOW 7d)" }
-        dueAt: { type: string, format: date-time }
-        author:
-          oneOf: [{ $ref: "#/components/schemas/PublicUser" }, { type: "null" }]
-          description: null when anonymousToStaff and caller is DEPT_ADMIN
+        student:
+          oneOf: [{ $ref: "#/components/schemas/StudentSummary" }, { type: "null" }]
+          description: Omitted/null in the student's own views
+        rowVersion: { type: string }
         createdAt: { type: string, format: date-time }
         updatedAt: { type: string, format: date-time }
         resolvedAt: { type: [string, "null"], format: date-time }
-
-    PublicUser:
-      type: object
-      required: [id, name]
-      properties:
-        id: { type: string }
-        name: { type: string }
-        studentId: { type: [string, "null"] }
-
-    TimelineEntry:
-      type: object
-      required: [id, type, createdAt]
-      properties:
-        id: { type: string }
-        type: { type: string, enum: [CREATED, STATUS_CHANGE, REMARK, STUDENT_REPLY] }
-        fromStatus: { oneOf: [{ $ref: "#/components/schemas/ComplaintStatus" }, { type: "null" }] }
-        toStatus: { oneOf: [{ $ref: "#/components/schemas/ComplaintStatus" }, { type: "null" }] }
-        body: { type: [string, "null"] }
-        actor:
-          type: object
-          required: [name, role]
-          properties:
-            name: { type: string }
-            role: { $ref: "#/components/schemas/Role" }
-        createdAt: { type: string, format: date-time }
-
-    Feedback:
-      type: object
-      required: [rating]
-      properties:
-        rating: { type: integer, minimum: 1, maximum: 5 }
-        comment: { type: [string, "null"] }
 
     ComplaintDetail:
       allOf:
         - $ref: "#/components/schemas/Complaint"
         - type: object
-          required: [timeline]
+          required: [description, remarks, attachments, allowedTransitions]
           properties:
-            timeline:
+            description: { type: string }
+            remarks:
               type: array
-              items: { $ref: "#/components/schemas/TimelineEntry" }
-            feedback:
-              oneOf: [{ $ref: "#/components/schemas/Feedback" }, { type: "null" }]
+              items: { $ref: "#/components/schemas/Remark" }
+            attachments:
+              type: array
+              items: { $ref: "#/components/schemas/Attachment" }
             allowedTransitions:
               type: array
-              description: Statuses the caller may move this complaint to right now (UI uses this to render the action menu; server still re-validates)
+              description: Statuses the caller may move this complaint to right now (empty for students and SuperAdmin). The server still re-validates.
               items: { $ref: "#/components/schemas/ComplaintStatus" }
+
+    CategorySummary:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+
+    StudentSummary:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        studentId: { type: [string, "null"] }
 
     ComplaintPage:
       type: object
-      required: [data, page, pageSize, total]
+      required: [items, pageNumber, pageSize, totalCount]
       properties:
-        data:
+        items:
           type: array
           items: { $ref: "#/components/schemas/Complaint" }
-        page: { type: integer }
+        pageNumber: { type: integer }
         pageSize: { type: integer }
-        total: { type: integer }
+        totalCount: { type: integer }
 
-    SupportState:
+    DashboardSummary:
       type: object
-      required: [supportCount, supportedByMe]
-      properties:
-        supportCount: { type: integer }
-        supportedByMe: { type: boolean }
-
-    Notification:
-      type: object
-      required: [id, message, complaintId, read, createdAt]
-      properties:
-        id: { type: string }
-        message: { type: string }
-        complaintId: { type: string }
-        read: { type: boolean }
-        createdAt: { type: string, format: date-time }
-
-    Summary:
-      type: object
-      required: [total, pending, inProgress, resolved, rejected, overdue]
+      required: [total, pending, inProgress, resolved, rejected]
       properties:
         total: { type: integer }
         pending: { type: integer }
         inProgress: { type: integer }
         resolved: { type: integer }
         rejected: { type: integer }
-        overdue: { type: integer }
-        avgResolutionHours: { type: [number, "null"] }
-        avgRating: { type: [number, "null"] }
 
     DepartmentCount:
       type: object
-      required: [department, count]
+      required: [departmentId, departmentName, count]
       properties:
-        department: { $ref: "#/components/schemas/Department" }
+        departmentId: { type: integer }
+        departmentName: { type: string }
         count: { type: integer }
 
     StatusCount:
@@ -732,18 +800,44 @@ components:
         status: { $ref: "#/components/schemas/ComplaintStatus" }
         count: { type: integer }
 
-    TrendPoint:
+    CategoryCount:
       type: object
-      required: [date, count]
+      required: [categoryId, categoryName, count]
       properties:
-        date: { type: string, format: date }
+        categoryId: { type: integer }
+        categoryName: { type: string }
         count: { type: integer }
 
-    RecurringIssue:
+    HistoryEntry:
       type: object
-      required: [category, subIssue, count, supportTotal]
+      required: [id, kind, createdAt]
       properties:
-        category: { $ref: "#/components/schemas/CategoryKey" }
-        subIssue: { type: string }
-        count: { type: integer }
-        supportTotal: { type: integer }
+        id: { type: integer, format: int64 }
+        kind: { type: string, enum: [Created, StatusChanged, Remark] }
+        fromStatus: { oneOf: [{ $ref: "#/components/schemas/ComplaintStatus" }, { type: "null" }] }
+        toStatus: { oneOf: [{ $ref: "#/components/schemas/ComplaintStatus" }, { type: "null" }] }
+        body: { type: [string, "null"] }
+        actorName: { type: string }
+        createdAt: { type: string, format: date-time }
+
+    Notification:
+      type: object
+      required: [id, message, complaintId, isRead, createdAt]
+      properties:
+        id: { type: integer, format: int64 }
+        message: { type: string }
+        complaintId: { type: integer, format: int64 }
+        isRead: { type: boolean }
+        createdAt: { type: string, format: date-time }
+
+    NotificationPage:
+      type: object
+      required: [items, pageNumber, pageSize, totalCount, unreadCount]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Notification" }
+        pageNumber: { type: integer }
+        pageSize: { type: integer }
+        totalCount: { type: integer }
+        unreadCount: { type: integer }

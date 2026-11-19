@@ -1,14 +1,14 @@
 # Competition Roadmap (10:00 AM → 3:00 PM)
 
-| Time | Claude (FE) | Codex (BE) | Sync |
+| Time | Claude (backend core) | Codex (tests + mobile) | Owner |
 |---|---|---|---|
-| 10:00–10:30 | Scaffold Vite/Tailwind/shadcn, `gen:api`, Prism mock, auth pages | Scaffold Express/Prisma, schema, migrate, seed, `/health` | Merge scaffolds |
-| 10:30–11:30 | Student submit + my complaints + detail | Auth, categories, complaints create/list/get with scope | Switch FE from mock → real for auth |
-| 11:30–12:30 | Admin inbox + detail + status/remark UI; route guards; 403/404 | Status machine, comments, timeline, notifications rows | **MVP checkpoint 12:30** |
-| 12:30–1:15 | Dashboards + Recharts (bar, donut) | Analytics endpoints + scope tests | **Deploy both (1:15)** |
-| 1:15–2:00 | Stretch: support, SLA badge, bell, rating, trend, CSV | Stretch: support, feedback, recurring, CSV, uploads | |
-| **2:00** | **FEATURE FREEZE** — bug fixes only | same | |
-| 2:00–2:45 | Polish, mobile, empty states, demo script | Prod seed, CORS, env check, smoke tests | |
-| 2:45–3:00 | Submit URL | | **Hit /health, test all 6 logins** |
+| 10:00–10:45 | Solution, DbContext, first migration, lookup seed, Identity, register/login/me, `/health` | Flutter scaffold, generate Dart client, Prism mock, login/register screens; test project + Testcontainers harness | Provision RDS + EC2 |
+| 10:45–11:45 | Categories, complaints create/list/detail with scope | Student screens; scope/forbidden tests for student | |
+| 11:45–12:30 | Department endpoints, status machine, rowVersion, remarks | Dept admin screens; state-machine + concurrency tests | **P0 checkpoint 12:30** |
+| 12:30–1:15 | Admin endpoints, dashboards, reports | Dashboards + charts; analytics scope tests | **First deploy to AWS (1:15)** |
+| 1:15–2:00 | Session (refresh/logout) → G1 → G2 | Single-flight refresh + session tests → G1/G2 UI | |
+| **2:00** | **FEATURE FREEZE** | | |
+| 2:00–2:45 | Bug fixes from failing tests; prod admin seed | APK release build, Firebase/Drive upload, demo script | Smoke test 6 logins |
+| 2:45–3:00 | | | Submit API URL + APK link |
 
-Cut order if behind: CSV → anonymous → trend → recurring → rating → notifications → support. Never cut: auth, submit, routing, RBAC 403, status updates, bar chart.
+Cut order if behind: G4 → G3 → G2 → G1 → attachments. Never cut: auth, submit, auto-routing, 403 isolation, status updates, bar chart, deployment. Session is a single bundle: ship it complete or not at all.
