@@ -21,10 +21,12 @@ public class EndpointTests(ApiFactory factory) : IClassFixture<ApiFactory>
         var data = (await response.Content.ReadFromJsonAsync<JsonObject>())!["data"]!;
         Assert.Equal("https://api.cloudinary.com/v1_1/test-cloud/image/upload", data["uploadUrl"]!.GetValue<string>());
         var fields = data["fields"]!; var id = fields["public_id"]!.GetValue<string>(); var timestamp = fields["timestamp"]!.GetValue<string>();
-        Assert.StartsWith("campusconnect/", id);
+        Assert.StartsWith("campusconnect/user-student/", id);
+        Assert.Equal(contentType == "image/jpeg" ? "jpg" : contentType[6..], fields["allowed_formats"]!.GetValue<string>());
+        Assert.Equal(5242880, data["maxFileSize"]!.GetValue<int>());
         Assert.Equal("test-public-key", fields["api_key"]!.GetValue<string>());
         Assert.Equal("false", fields["overwrite"]!.GetValue<string>());
-        var expected = Convert.ToHexStringLower(SHA1.HashData(Encoding.UTF8.GetBytes($"overwrite=false&public_id={id}&timestamp={timestamp}test-signing-secret")));
+        var expected = Convert.ToHexStringLower(SHA1.HashData(Encoding.UTF8.GetBytes($"allowed_formats={fields["allowed_formats"]!.GetValue<string>()}&overwrite=false&public_id={id}&timestamp={timestamp}test-signing-secret")));
         Assert.Equal(expected, fields["signature"]!.GetValue<string>());
         Assert.Equal($"https://res.cloudinary.com/test-cloud/image/upload/{id}", data["publicUrl"]!.GetValue<string>());
         Assert.DoesNotContain("test-signing-secret", data.ToJsonString());
@@ -46,7 +48,7 @@ public class EndpointTests(ApiFactory factory) : IClassFixture<ApiFactory>
         using var client = unconfigured.CreateClient();
         using var authenticated = await factory.Login("student"); client.DefaultRequestHeaders.Authorization = authenticated.DefaultRequestHeaders.Authorization;
         var response = await client.PostAsJsonAsync("/api/v1/uploads/sign", new { contentType = "image/jpeg" });
-        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
         Assert.Equal("INTERNAL", (await response.Content.ReadFromJsonAsync<JsonObject>())!["error"]!["code"]!.GetValue<string>());
     }
     [Fact]
@@ -81,16 +83,16 @@ public class EndpointTests(ApiFactory factory) : IClassFixture<ApiFactory>
         }
     }
     [Fact]
-    public async Task Rejection_requires_reason_and_only_super_admin_can_reopen()
+    public async Task Rejection_is_terminal_and_super_admin_cannot_reopen()
     {
         using var student = await factory.Login("student"); using var admin = await factory.Login("library"); using var super = await factory.Login("super");
         var created = await student.PostAsJsonAsync("/api/v1/complaints", new { category = "LIBRARY", title = "Rejected complaint example", description = "Test the reason and reopen restrictions." });
         Assert.Equal(HttpStatusCode.Created, created.StatusCode);
         var id = (await created.Content.ReadFromJsonAsync<JsonObject>())!["data"]!["id"]!.GetValue<string>();
-        Assert.Equal(HttpStatusCode.UnprocessableEntity, (await admin.PatchAsJsonAsync($"/api/v1/complaints/{id}/status", new { status = "REJECTED", remark = " " })).StatusCode);
-        Assert.Equal(HttpStatusCode.OK, (await admin.PatchAsJsonAsync($"/api/v1/complaints/{id}/status", new { status = "REJECTED", remark = "Duplicate report." })).StatusCode);
-        Assert.Equal(HttpStatusCode.Conflict, (await admin.PatchAsJsonAsync($"/api/v1/complaints/{id}/status", new { status = "IN_PROGRESS" })).StatusCode);
-        Assert.Equal(HttpStatusCode.OK, (await super.PatchAsJsonAsync($"/api/v1/complaints/{id}/status", new { status = "IN_PROGRESS" })).StatusCode);
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, (await admin.PatchStatusAsync($"/api/v1/complaints/{id}/status", new { status = "REJECTED", remark = " " })).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await admin.PatchStatusAsync($"/api/v1/complaints/{id}/status", new { status = "REJECTED", remark = "Duplicate report." })).StatusCode);
+        Assert.Equal(HttpStatusCode.Conflict, (await admin.PatchStatusAsync($"/api/v1/complaints/{id}/status", new { status = "IN_PROGRESS" })).StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, (await super.PatchStatusAsync($"/api/v1/complaints/{id}/status", new { status = "IN_PROGRESS" })).StatusCode);
     }
     [Fact]
     public async Task Read_all_changes_only_the_callers_notifications()

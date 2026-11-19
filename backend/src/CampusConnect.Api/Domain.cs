@@ -19,11 +19,10 @@ public static class Catalog
         ("LAB_IT", "lab-it", "Labs & IT", ["Non-functional computers", "Internet connectivity issues", "Projector or multimedia equipment problems", "Missing or unavailable software"]),
         ("ACADEMIC", "academic", "Teaching & Academic", ["Teachers arriving late to lectures", "Unavailability of lecture notes or learning materials", "Inadequate explanation of course topics", "Classroom management or discipline issues"])
     ];
-    public static string[] Transitions(string status, string role) => role == Roles.Student ? [] : status switch
+    public static string[] Transitions(string status, string role) => role != Roles.Admin ? [] : status switch
     {
         "PENDING" => ["IN_PROGRESS", "REJECTED"],
         "IN_PROGRESS" => ["RESOLVED", "REJECTED"],
-        _ when role == Roles.Super => ["IN_PROGRESS"],
         _ => []
     };
     public static DateTime Due(DateTime created, string priority) => created.AddHours(priority switch { "HIGH" => 24, "LOW" => 168, _ => 72 });

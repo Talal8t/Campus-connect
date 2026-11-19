@@ -28,7 +28,7 @@ public class ContractTests(ApiFactory factory) : IClassFixture<ApiFactory>
     {
         var collection = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "CampusConnect.http"));
         var requests = System.Text.RegularExpressions.Regex.Matches(collection, @"(?m)^(GET|POST|PUT|PATCH|DELETE) \{\{baseUrl\}\}([^\r\n?]+)")
-            .Select(m => (Method: m.Groups[1].Value, Path: m.Groups[2].Value.Replace("{{complaintId}}", "{id}").Replace("demo-001", "{id}").Replace("demo-002", "{id}"))).ToHashSet();
+            .Select(m => (Method: m.Groups[1].Value, Path: m.Groups[2].Value.Replace("{{complaintId}}", "{id}").Replace("{{createComplaint.response.body.$.data.id}}", "{id}").Replace("demo-001", "{id}").Replace("demo-002", "{id}"))).ToHashSet();
         foreach (var path in Contract["paths"]!.AsObject())
         foreach (var operation in path.Value!.AsObject().Where(x => x.Key is "get" or "post" or "put" or "patch" or "delete"))
             Assert.Contains((operation.Key.ToUpperInvariant(), path.Key), requests);
@@ -57,10 +57,16 @@ public class ContractTests(ApiFactory factory) : IClassFixture<ApiFactory>
     public async Task Auth_and_error_responses_validate_against_contract()
     {
         using var client = factory.CreateClient();
-        var response = await client.PostAsJsonAsync("/api/v1/auth/login", new { email = "student@campusconnect.edu", password = "Campus@123" });
+        var response = await client.PostAsJsonAsync("/api/v1/auth/login", new { email = "student@campusconnect.edu", password = factory.SeedPassword });
         Validate(new JsonObject { ["$ref"] = "#/components/schemas/AuthResponse" }, await response.Content.ReadAsStringAsync());
         var error = await client.GetAsync("/api/v1/auth/me");
         Validate(new JsonObject { ["$ref"] = "#/components/schemas/Error" }, await error.Content.ReadAsStringAsync());
+    }
+    [Fact]
+    public void Http_collection_has_no_response_dependent_global_variables()
+    {
+        var collection = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "CampusConnect.http"));
+        Assert.DoesNotMatch(@"(?m)^@\w+\s*=.*\.response\.", collection);
     }
     private static void Validate(JsonNode schema, string payload)
     {

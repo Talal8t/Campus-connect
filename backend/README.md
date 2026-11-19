@@ -1,79 +1,66 @@
 # CampusConnect backend
 
-ASP.NET Core 10, EF Core 10, SQL Server, and SignalR. This stack follows the human's explicit instruction on 2026-11-19 and supersedes the older Express/Prisma/Postgres guidance in the root Markdown files. `CONTRACT.md` and `contract/openapi.yaml` still define REST behavior. Frontend files are untouched.
+ASP.NET Core 10, EF Core 10, SQL Server and optional authenticated SignalR. This is the human-selected backend stack; routes remain /api/v1. No frontend/views are included. PR #3's owner review selects read-only SuperAdmin access and mandatory row versions. The integrator is revising the canonical contract separately; see contracts/PR3_REVIEW.md for the exact changes.
 
-## Run locally (PowerShell)
+## Local setup (PowerShell)
 
-For Visual Studio Development launches, configure `JWT_SECRET` through the API project's **Manage User Secrets** menu. The project has a `UserSecretsId`, so ASP.NET Core loads that local configuration automatically in Development. Use a randomly generated key of at least 32 bytes; keep its value out of source control. Stop and restart debugging after configuring it. Production must supply its own key through deployment configuration.
+Install a .NET 10 SDK and SQL Server 2022+ (or Windows LocalDB). global.json already uses latestFeature roll-forward. From backend/:
 
-Install the .NET 10 SDK and SQL Server 2022+ (or Windows SQL Server LocalDB). From `backend/`:
+    dotnet tool restore
+    dotnet restore CampusConnect.sln --locked-mode
+    $env:JWT_SECRET = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(48))
+    $env:ConnectionStrings__DefaultConnection = 'Server=(localdb)\MSSQLLocalDB;Database=CampusConnect;Integrated Security=true;TrustServerCertificate=true'
+    $env:CORS_ORIGINS = 'http://localhost:5173'
+    $env:SEED_PASSWORD = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(24))
+    dotnet run --project src/CampusConnect.Api -- --seed
+    dotnet run --project src/CampusConnect.Api --no-launch-profile --urls http://localhost:4000
 
-```powershell
-dotnet tool restore
-dotnet restore CampusConnect.sln --locked-mode
-$env:JWT_SECRET = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(48))
-$env:ConnectionStrings__DefaultConnection = 'Server=(localdb)\MSSQLLocalDB;Database=CampusConnect;Integrated Security=true;TrustServerCertificate=true'
-$env:CORS_ORIGINS = 'http://localhost:5173'
-dotnet run --project src/CampusConnect.Api -- --seed
-dotnet run --project src/CampusConnect.Api --no-launch-profile --urls http://localhost:4000
-```
+Integrated Security is a local Windows option only. There is no runtime connection-string fallback: ConnectionStrings__DefaultConnection is required in all environments. ASP.NET Core does not automatically load .env; export variables or configure the host. Local Docker requires SQL authentication; use sqlserver as host for its database, and TrustServerCertificate=true for the container's self-signed certificate. Set the variables before docker compose up -d. Apply migrations explicitly before accepting traffic.
 
-The `.env.example` lists configuration; ASP.NET Core does **not** automatically load `.env`. Export variables in the shell or set them in the hosting environment. With Docker, set `MSSQL_SA_PASSWORD`, run `docker compose up -d`, and use the SQL authentication connection string shown in `.env.example`. Use a trusted SQL Server certificate in production; `TrustServerCertificate=true` is for local development.
+No seeding occurs on normal startup. Explicit --seed requires SEED_PASSWORD (at least 8 characters and at most 72 UTF-8 bytes), including Production. Missing/invalid seed credentials fail before migrations or seed writes. Explicit reseeding rotates existing demo-account passwords too. Do not seed demo accounts into a real production database; provision real administrators/departments separately.
 
-`GET http://localhost:4000/api/v1/health` returns `{"status":"ok"}`. `--migrate` applies migrations and exits. `--seed` applies migrations, seeds demo accounts/data, and exits; it is explicit and idempotent. Never seed demo accounts into a production database. On a fresh non-demo database, provision the four departments and administrator accounts through an operational database process before accepting traffic.
+Demo emails: super@campusconnect.edu, cafeteria@campusconnect.edu, library@campusconnect.edu, labit@campusconnect.edu, academic@campusconnect.edu, student@campusconnect.edu, student2@campusconnect.edu. Use the externally supplied SEED_PASSWORD; there is no committed shared default.
 
-## API and authorization
+## Authorization and concurrency
 
-- Base path `/api/v1`; bearer JWT (HS256, seven days); bcrypt passwords.
-- Registration always creates a student. Administrators are provisioned separately.
-- All complaint reads and mutations use centralized role scope. Out-of-scope direct requests return 403. Department routing derives from category, never client input.
-- Includes complaint create/list/detail, status transitions, timeline/comments, feedback, notifications/read-all, summary/department/status/trend/recurring analytics, CSV export, and Cloudinary upload signatures.
-- JSON follows the OpenAPI envelope, including the **unwrapped** login/register response and support state. Health is also unwrapped.
-- Status updates atomically persist the complaint, timeline, and notification. A concurrency token rejects stale updates. Ticket allocation uses a serializable per-year counter transaction.
-- Anonymous students are hidden in both the complaint author and student timeline actor when a department admin reads the complaint.
-- CORS uses explicit origins. Auth attempts are rate limited per remote IP. Behind a proxy, configure trusted forwarded headers before relying on per-client IP limits.
+- Students submit/read their own complaints and rate resolved complaints once. Support stays denied under deferred issue #4. Students cannot post department remarks.
+- Department admins read/update complaints in their department and provide remarks. Out-of-scope direct access returns 403.
+- SuperAdmin is read-only: system-wide complaint reads, analytics and CSV exports. Status/comments return 403; allowedTransitions is empty. Terminal complaints cannot be reopened.
+- Status PATCH requires rowVersion from a fresh complaint GET or latest successful status response. Missing/invalid version returns 422; stale version returns 409 CONFLICT with no history/notification/status writes. Comments change the version too; fetch detail afterward.
+- Status/remark writes atomically save their timeline and owner notification. There is no self-notification. A ticket-counter duplicate/deadlock is retried once in a fresh serializable transaction.
+- Auth attempts are limited per client IP after trusted forwarded headers. 429 uses RATE_LIMITED.
 
-### Known contract conflict: support
+CampusConnect.http uses direct named-response references. Run the logins, createComplaint and departmentDetail first. After status/comment changes, refreshBeforeResolution supplies a new version. Its password comes from the SEED_PASSWORD process variable: launch the editor from that configured shell or use a private local HTTP environment. Response-dependent global aliases cause HTTP0012 before their source request has run and are deliberately avoided.
 
-The existing agreement requires that students can access only their own complaints and forbids supporting one's own complaint. Consequently no student can currently add/remove support. Both routes preserve the 403 boundary. A separate contract change must define a safe complaint discovery/support policy before enabling this feature; the REST spec has not been silently changed. Seeded support counts remain available in complaint views and analytics.
+## Cloudinary uploads
 
-### SignalR
+Cloudinary remains the direct image provider; S3 is not required. Supply CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET. /uploads/sign validates JPEG/PNG/WebP contentType and optional fileSize (1–5242880 bytes). It signs allowed_formats and an account-specific campusconnect/{userId}/ public ID. Send every returned field during the direct upload. maxFileSize=5242880 is a client hint, not a provider-enforced signed parameter.
 
-Optional transport at `/hubs/notifications`; existing REST notification polling remains available. Connect with the normal JWT using SignalR's `accessTokenFactory`. Listen for event `notification` with the same notification shape as REST. Group membership derives only from the authenticated user; clients cannot select other users' groups. Notifications are saved before broadcasting, so reconnecting clients can retrieve missed events via REST. This is an additive transport documented here, outside the unchanged REST OpenAPI specification.
+Complaint image URLs must be HTTPS on res.cloudinary.com, within the configured cloud's image/upload namespace and the submitting user's application folder. Foreign clouds/hosts, fetch transformations, embedded credentials, query strings and arbitrary folders are rejected. Before attachment the API checks the real public ID, format and byte count (1–5 MiB) through the Cloudinary Admin API using server credentials. Verification errors fail closed; no untrusted URL is fetched.
 
-```typescript
-const connection = new HubConnectionBuilder()
-  .withUrl(`${apiOrigin}/hubs/notifications`, { accessTokenFactory: () => token })
-  .withAutomaticReconnect().build();
-connection.on('notification', notification => refreshNotifications());
-await connection.start();
-```
+Cloudinary does not document a max_file_size upload parameter; current preset documentation explicitly says presets have no per-preset size cap. No invented parameter is signed here. Actual complaint attachment size is enforced by resource verification. A larger file may still reach Cloudinary storage before rejection: a strict pre-storage 5 MiB cap requires a different upload architecture/provider capability and is not claimed. Real Cloudinary uploads remain a deployment smoke test.
 
-Cloudinary signing requires the three `CLOUDINARY_*` variables. Credentials stay on the server; the browser uploads bytes directly. Configure allowed formats and upload size limits in the Cloudinary account before production.
+Sources: [Upload API](https://cloudinary.com/documentation/image_upload_api_reference), [upload preset limitations](https://cloudinary.com/documentation/upload_presets).
 
-## Verify and CI
+## EC2, Nginx and SQL Server/RDS
 
-### Try every endpoint
+Install the ASP.NET Core 10 runtime on EC2 and keep SQL Server separate. Use a private environment file (chmod 600) containing JWT_SECRET (at least 32 bytes), ConnectionStrings__DefaultConnection, CORS_ORIGINS, TRUSTED_PROXIES and Cloudinary credentials. Use SQL authentication and a trusted SQL Server certificate with Encrypt=true; TrustServerCertificate=true is a deliberate local/demo exception. Restrict database port 1433 to the EC2 security group.
 
-Open `CampusConnect.http` in VS Code with REST Client, or Visual Studio's HTTP editor. Seed/start the API first, then execute requests in file order. The named student/department/super-admin login requests supply reusable tokens; `createComplaint` supplies the complaint ID for the complete status/comment/feedback lifecycle. Set `@host` for a different server. Change the registration email when repeating registration, and create a fresh complaint when repeating the lifecycle.
+Publish: dotnet publish src/CampusConnect.Api -c Release -o publish. Apply migrations once as a release step: dotnet CampusConnect.Api.dll --migrate. Then start with ASPNETCORE_URLS=http://127.0.0.1:5080. Example systemd/Nginx files are in deploy/; adapt paths/domain/certificates and validate with nginx -t before installing. Configure HTTPS for Android/browser clients.
 
-The collection covers every OpenAPI method/path, filtering, CSV, upload signing, SignalR negotiation, and expected 403/422 responses. Upload signing needs the configured Cloudinary credentials; live WebSocket events need a SignalR client. Support examples deliberately return 403 pending a contract decision. The requested issue could not be created because GitHub integration issue-write access was denied; its ready-to-file draft is `issues/support-contract.md`.
+Forwarded headers run before rate limiting. Default trusted proxies are 127.0.0.1 and ::1, one hop. TRUSTED_PROXIES must list the exact immediate proxy addresses when different. Nginx overwrites X-Forwarded-For with $remote_addr and X-Forwarded-Proto with $scheme as shown in the example. Docker requires the actual Nginx-to-container peer IP; loopback defaults deliberately do not trust bridge networks. [Microsoft proxy guidance](https://learn.microsoft.com/en-us/aspnet/core/host-and-deploy/linux-nginx?view=aspnetcore-10.0).
 
-```powershell
-dotnet build CampusConnect.sln -c Release --no-restore
-dotnet test CampusConnect.sln -c Release --logger trx
-dotnet ef migrations has-pending-model-changes --project src/CampusConnect.Api
-dotnet publish src/CampusConnect.Api -c Release -o publish
-```
+GET /api/v1/health checks database connectivity: 200 with status ok, or 503 with status unavailable. It is a readiness probe now. Optional SignalR is at /hubs/notifications; persisted REST notifications remain authoritative and mobile clients may poll every 30 seconds. Hosting request-start logs are suppressed because browser SignalR authentication may use access_token in query strings. Production HTTPS/WebSocket/reconnect checks remain deployment work. Multiple live API instances require a backplane or managed SignalR service.
 
-Tests use an isolated, randomly named SQL Server database, apply real migrations, and delete only that test database when finished. Default: Windows LocalDB. On other platforms set `TEST_DATABASE_URL` to a SQL Server connection string with database creation permissions; the test harness overrides the database name. No production connection string is used implicitly.
+## Known session gap
 
-Tests cover the four mandated forbidden access cases, registration privilege escalation, automatic routing, status/remark validation, audit history, anonymous timeline privacy, feedback uniqueness, notification isolation and read-all behavior, scoped analytics, CSV filtering/formula escaping, Cloudinary signature generation and role/format validation, SignalR negotiation auth, and OpenAPI 3.1 response validation. Contract checks ensure every specified REST operation is registered and appears in the HTTP collection. Latest local validation: 39 tests passed against SQL Server LocalDB; Release build had zero warnings/errors. Upload-signing tests use fake test-only credentials and do not upload files to Cloudinary.
+The demo retains seven-day HS256 access JWTs. Refresh rotation, server-side revocation and logout invalidation are not implemented. Do not shorten JWTs to 15 minutes without the separately designed refresh flow and client/security tests. This gap is explicit rather than silently expiring demo sessions.
 
-GitHub Actions `.github/workflows/backend-ci.yml` restores locked dependencies, builds with warnings as errors, checks model/migration drift, tests against a SQL Server 2022 service, and publishes API/test artifacts. Push the feature branch to activate it. The workflow is not a deployment pipeline.
+## Verification
 
-## Deploy
+    dotnet build CampusConnect.sln -c Release --no-restore
+    dotnet test CampusConnect.sln -c Release --logger trx
+    dotnet ef migrations has-pending-model-changes --project src/CampusConnect.Api --configuration Release
+    dotnet publish src/CampusConnect.Api -c Release -o publish
 
-Build the Dockerfile with `backend/` as its context, or publish the API to an ASP.NET Core host. Set the database connection string, a unique JWT secret, and the frontend CORS origin. Apply migrations once as a release step (`dotnet CampusConnect.Api.dll --migrate`) before starting the service. Health check: `/api/v1/health` (liveness, not database readiness). SQL Server needs persistent managed storage; the former Neon/Postgres deployment instructions do not apply. Multiple API instances require a SignalR backplane or managed SignalR service for cross-instance delivery.
-
-Demo password `Campus@123`: `super@campusconnect.edu`, `cafeteria@campusconnect.edu`, `library@campusconnect.edu`, `labit@campusconnect.edu`, `academic@campusconnect.edu`, `student@campusconnect.edu`, `student2@campusconnect.edu`.
+Tests use isolated, randomly named SQL Server databases, apply real migrations, and delete only those test databases. Windows defaults to LocalDB; Linux uses TEST_DATABASE_URL with database-creation permissions. Test seed credentials are generated per fixture. CI uses a SQL Server 2022 service and an explicit design-time connection; no test uses a production database implicitly. Build treats warnings as errors.

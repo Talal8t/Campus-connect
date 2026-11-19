@@ -3,7 +3,7 @@ using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 
 namespace CampusConnect.Api;
-public class ComplaintService(AppDb db, CurrentUser current, IHubContext<NotificationHub> hub, ILogger<ComplaintService> log)
+public class ComplaintService(AppDb db, CurrentUser current, IHubContext<NotificationHub> hub, ILogger<ComplaintService> log, CloudinaryUploads uploads, TimeProvider clock)
 {
     public IQueryable<Complaint> Full => db.Complaints.Include(x => x.Author).Include(x => x.Department)
         .Include(x => x.Supports).Include(x => x.Feedback).Include(x => x.Timeline).ThenInclude(x => x.Actor).AsSplitQuery();
@@ -16,30 +16,44 @@ public class ComplaintService(AppDb db, CurrentUser current, IHubContext<Notific
     public async Task<object> Create(CreateComplaintRequest r)
     {
         var user = await current.Get(); Scope.Student(user);
-        if (r.ImageUrls?.Any(url => !Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https")) == true)
-            throw ApiError.Invalid("Image URLs must be absolute HTTP or HTTPS URLs.");
+        await uploads.Validate(r.ImageUrls ?? [], user);
         var category = Catalog.Categories.Single(x => x.Key == r.Category);
         var department = await db.Departments.SingleAsync(x => x.Slug == category.Slug);
-        await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
-        var now = DateTime.UtcNow;
-        var counter = await db.TicketCounters.FindAsync(now.Year);
-        if (counter is null) { counter = new TicketCounter { Year = now.Year }; db.Add(counter); }
-        counter.Value++;
-        var c = new Complaint
+        for (var attempt = 0; ; attempt++)
         {
-            Sequence = counter.Value, Ticket = $"CC-{now.Year}-{counter.Value:D4}", Author = user, Department = department,
-            Category = r.Category, Title = r.Title.Trim(), Description = r.Description.Trim(), Priority = r.Priority ?? "MEDIUM",
-            SubIssue = r.SubIssue, Location = r.Location, ImageUrls = r.ImageUrls ?? [], AnonymousToStaff = r.AnonymousToStaff,
-            CreatedAt = now, UpdatedAt = now, DueAt = Catalog.Due(now, r.Priority ?? "MEDIUM")
-        };
-        c.Timeline.Add(new TimelineEntry { Actor = user, Type = "CREATED", ToStatus = "PENDING", CreatedAt = now });
-        db.Complaints.Add(c); await db.SaveChangesAsync(); await transaction.CommitAsync();
-        return Views.Complaint(c, user);
+            await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
+            try
+            {
+
+                var now = clock.GetUtcNow().UtcDateTime;
+                var counter = await db.TicketCounters.FindAsync(now.Year);
+                if (counter is null) { counter = new TicketCounter { Year = now.Year }; db.Add(counter); }
+                counter.Value++;
+                var c = new Complaint
+                {
+                    Sequence = counter.Value, Ticket = $"CC-{now.Year}-{counter.Value:D4}", Author = user, Department = department,
+                    Category = r.Category, Title = r.Title.Trim(), Description = r.Description.Trim(), Priority = r.Priority ?? "MEDIUM",
+                    SubIssue = r.SubIssue, Location = r.Location, ImageUrls = r.ImageUrls ?? [], AnonymousToStaff = r.AnonymousToStaff,
+                    CreatedAt = now, UpdatedAt = now, DueAt = Catalog.Due(now, r.Priority ?? "MEDIUM")
+                };
+                c.Timeline.Add(new TimelineEntry { Actor = user, Type = "CREATED", ToStatus = "PENDING", CreatedAt = now });
+                db.Complaints.Add(c); await db.SaveChangesAsync(); await transaction.CommitAsync();
+                return Views.Complaint(c, user);
+            }
+            catch (Exception error) when (attempt == 0 && DatabaseConflicts.IsRace(error))
+            {
+                // Disposal rolls back the failed transaction; reload the counter on the second attempt.
+                db.ChangeTracker.Clear(); db.Attach(user); db.Attach(department);
+            }
+        }
     }
+
     public async Task<object> ChangeStatus(string id, StatusRequest r)
     {
-        var user = await current.Get(); Scope.Admin(user);
+        var user = await current.Get(); Scope.DepartmentAdmin(user);
         var c = await Load(id);
+        if (r.RowVersion is null) throw ApiError.Invalid("rowVersion is required.");
+        if (r.RowVersion != c.Version) throw new ApiError(409, "CONFLICT", "The complaint changed. Reload it and retry.");
         if (!Catalog.Transitions(c.Status, user.Role).Contains(r.Status)) throw new ApiError(409, "INVALID_TRANSITION", "This status transition is not allowed.");
         if (r.Status is "RESOLVED" or "REJECTED" && string.IsNullOrWhiteSpace(r.Remark)) throw ApiError.Invalid("A remark is required for resolution or rejection.");
         var entry = new TimelineEntry { ComplaintId = c.Id, Actor = user, Type = "STATUS_CHANGE", FromStatus = c.Status, ToStatus = r.Status, Body = r.Remark };
@@ -53,11 +67,12 @@ public class ComplaintService(AppDb db, CurrentUser current, IHubContext<Notific
     }
     public async Task<object> Comment(string id, CommentRequest r)
     {
-        var user = await current.Get(); var c = await Load(id);
-        var entry = new TimelineEntry { ComplaintId = id, Actor = user, Type = user.Role == Roles.Student ? "STUDENT_REPLY" : "REMARK", Body = r.Body.Trim() };
+        var user = await current.Get(); Scope.DepartmentAdmin(user); var c = await Load(id);
+        var entry = new TimelineEntry { ComplaintId = id, Actor = user, Type = "REMARK", Body = r.Body.Trim() };
         c.Timeline.Add(entry); c.UpdatedAt = DateTime.UtcNow; c.Version = Guid.NewGuid();
-        var notification = Notify(c, $"{c.Ticket}: {r.Body.Trim()}");
-        await db.SaveChangesAsync(); await Publish(notification);
+        var notification = c.AuthorId == user.Id ? null : Notify(c, $"{c.Ticket}: {r.Body.Trim()}");
+        await db.SaveChangesAsync();
+        if (notification is not null) await Publish(notification);
         return Views.Timeline(entry, c, user);
     }
     public async Task<object> Feedback(string id, FeedbackRequest r)

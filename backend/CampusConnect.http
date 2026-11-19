@@ -5,12 +5,7 @@
 # Demo credentials below are for the explicit local demo seed only.
 @host = http://localhost:4000
 @baseUrl = {{host}}/api/v1
-@demoPassword = Campus@123
-@studentToken = {{studentLogin.response.body.$.token}}
-@departmentToken = {{departmentLogin.response.body.$.token}}
-@superToken = {{superLogin.response.body.$.token}}
-@complaintId = {{createComplaint.response.body.$.data.id}}
-@departmentId = {{departmentLogin.response.body.$.user.department.id}}
+@demoPassword = {{$processEnv SEED_PASSWORD}}
 
 ### Liveness — 200 (public)
 # @name health
@@ -61,19 +56,19 @@ Content-Type: application/json
 {
   "name": "HTTP Demo Student",
   "email": "http.demo@campusconnect.edu",
-  "password": "Campus@123",
+  "password": "{{demoPassword}}",
   "studentId": "BIIT-HTTP-001"
 }
 
 ### Current student — 200
 # @name currentUser
 GET {{baseUrl}}/auth/me
-Authorization: Bearer {{studentToken}}
+Authorization: Bearer {{studentLogin.response.body.$.token}}
 
 ### Create a library complaint — 201; department assigned by the server
 # @name createComplaint
 POST {{baseUrl}}/complaints
-Authorization: Bearer {{studentToken}}
+Authorization: Bearer {{studentLogin.response.body.$.token}}
 Content-Type: application/json
 
 {
@@ -90,32 +85,32 @@ Content-Type: application/json
 ### My complaints — 200; only the authenticated student's records
 # @name myComplaints
 GET {{baseUrl}}/complaints?page=1&pageSize=20&sort=newest
-Authorization: Bearer {{studentToken}}
+Authorization: Bearer {{studentLogin.response.body.$.token}}
 
 ### Department inbox — 200; only library records
 # @name departmentComplaints
 GET {{baseUrl}}/complaints?category=LIBRARY&status=PENDING&priority=HIGH&overdue=false&sort=priority&page=1&pageSize=20
-Authorization: Bearer {{departmentToken}}
+Authorization: Bearer {{departmentLogin.response.body.$.token}}
 
 ### Super administrator search — 200; optional department filter
 # @name searchComplaints
-GET {{baseUrl}}/complaints?departmentId={{departmentId}}&q=library&sort=mostSupported&page=1&pageSize=20
-Authorization: Bearer {{superToken}}
+GET {{baseUrl}}/complaints?departmentId={{departmentLogin.response.body.$.user.department.id}}&q=library&sort=mostSupported&page=1&pageSize=20
+Authorization: Bearer {{superLogin.response.body.$.token}}
 
 ### Complaint detail and timeline — 200
 # @name complaintDetail
-GET {{baseUrl}}/complaints/{{complaintId}}
-Authorization: Bearer {{studentToken}}
+GET {{baseUrl}}/complaints/{{createComplaint.response.body.$.data.id}}
+Authorization: Bearer {{studentLogin.response.body.$.token}}
 
 ### Department view — 200; author hidden when anonymousToStaff is true
 # @name departmentDetail
-GET {{baseUrl}}/complaints/{{complaintId}}
-Authorization: Bearer {{departmentToken}}
+GET {{baseUrl}}/complaints/{{createComplaint.response.body.$.data.id}}
+Authorization: Bearer {{departmentLogin.response.body.$.token}}
 
 ### Start handling — 200 (PENDING -> IN_PROGRESS)
 # @name startComplaint
-PATCH {{baseUrl}}/complaints/{{complaintId}}/status
-Authorization: Bearer {{departmentToken}}
+PATCH {{baseUrl}}/complaints/{{createComplaint.response.body.$.data.id}}/status
+Authorization: Bearer {{departmentLogin.response.body.$.token}}
 Content-Type: application/json
 
 {
@@ -125,49 +120,56 @@ Content-Type: application/json
 
 ### Department remark — 201
 # @name departmentComment
-POST {{baseUrl}}/complaints/{{complaintId}}/comments
-Authorization: Bearer {{departmentToken}}
+POST {{baseUrl}}/complaints/{{createComplaint.response.body.$.data.id}}/comments
+Authorization: Bearer {{departmentLogin.response.body.$.token}}
 Content-Type: application/json
 
 {
   "body": "Replacement chairs have been requested."
 }
 
-### Student reply — 201
+### Student reply — 403 (department-admin-only remarks)
 # @name studentReply
-POST {{baseUrl}}/complaints/{{complaintId}}/comments
-Authorization: Bearer {{studentToken}}
+POST {{baseUrl}}/complaints/{{createComplaint.response.body.$.data.id}}/comments
+Authorization: Bearer {{studentLogin.response.body.$.token}}
 Content-Type: application/json
 
 {
   "body": "Thank you. The damaged chairs are beside the east windows."
 }
 
+### Refresh the version after status/comment changes
+# @name refreshBeforeResolution
+GET {{baseUrl}}/complaints/{{createComplaint.response.body.$.data.id}}
+Authorization: Bearer {{departmentLogin.response.body.$.token}}
+
 ### Validation check: resolution without a remark — 422
 # @name invalidResolution
-PATCH {{baseUrl}}/complaints/{{complaintId}}/status
-Authorization: Bearer {{departmentToken}}
-Content-Type: application/json
-
-{
-  "status": "RESOLVED"
-}
-
-### Resolve — 200 (IN_PROGRESS -> RESOLVED; remark required)
-# @name resolveComplaint
-PATCH {{baseUrl}}/complaints/{{complaintId}}/status
-Authorization: Bearer {{departmentToken}}
+PATCH {{baseUrl}}/complaints/{{createComplaint.response.body.$.data.id}}/status
+Authorization: Bearer {{departmentLogin.response.body.$.token}}
 Content-Type: application/json
 
 {
   "status": "RESOLVED",
+  "rowVersion": "{{refreshBeforeResolution.response.body.$.data.rowVersion}}"
+}
+
+### Resolve — 200 (IN_PROGRESS -> RESOLVED; remark required)
+# @name resolveComplaint
+PATCH {{baseUrl}}/complaints/{{createComplaint.response.body.$.data.id}}/status
+Authorization: Bearer {{departmentLogin.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "status": "RESOLVED",
+  "rowVersion": "{{refreshBeforeResolution.response.body.$.data.rowVersion}}",
   "remark": "Damaged chairs have been replaced and additional seats installed."
 }
 
 ### Resolution feedback — 201; owner only, once per resolved complaint
 # @name resolutionFeedback
-POST {{baseUrl}}/complaints/{{complaintId}}/feedback
-Authorization: Bearer {{studentToken}}
+POST {{baseUrl}}/complaints/{{createComplaint.response.body.$.data.id}}/feedback
+Authorization: Bearer {{studentLogin.response.body.$.token}}
 Content-Type: application/json
 
 {
@@ -178,47 +180,47 @@ Content-Type: application/json
 ### Notifications — 200; caller only
 # @name notifications
 GET {{baseUrl}}/notifications?unreadOnly=true
-Authorization: Bearer {{studentToken}}
+Authorization: Bearer {{studentLogin.response.body.$.token}}
 
 ### Mark notifications read — 204, no response body
 # @name readAllNotifications
 POST {{baseUrl}}/notifications/read-all
-Authorization: Bearer {{studentToken}}
+Authorization: Bearer {{studentLogin.response.body.$.token}}
 
 ### System summary — 200; super administrator
 # @name systemSummary
 GET {{baseUrl}}/analytics/summary
-Authorization: Bearer {{superToken}}
+Authorization: Bearer {{superLogin.response.body.$.token}}
 
 ### Department summary — 200; always scoped to the administrator's department
 # @name departmentSummary
-GET {{baseUrl}}/analytics/summary?departmentId={{departmentId}}
-Authorization: Bearer {{departmentToken}}
+GET {{baseUrl}}/analytics/summary?departmentId={{departmentLogin.response.body.$.user.department.id}}
+Authorization: Bearer {{departmentLogin.response.body.$.token}}
 
 ### Complaints per department — 200
 # @name departmentChart
 GET {{baseUrl}}/analytics/by-department
-Authorization: Bearer {{superToken}}
+Authorization: Bearer {{superLogin.response.body.$.token}}
 
 ### Complaints per status — 200
 # @name statusChart
 GET {{baseUrl}}/analytics/by-status
-Authorization: Bearer {{departmentToken}}
+Authorization: Bearer {{departmentLogin.response.body.$.token}}
 
 ### Daily complaint trend — 200 (days 1–90)
 # @name trendChart
 GET {{baseUrl}}/analytics/trend?days=14
-Authorization: Bearer {{superToken}}
+Authorization: Bearer {{superLogin.response.body.$.token}}
 
 ### Recurring issue clusters — 200
 # @name recurringIssues
 GET {{baseUrl}}/analytics/recurring
-Authorization: Bearer {{superToken}}
+Authorization: Bearer {{superLogin.response.body.$.token}}
 
 ### Scoped CSV export — 200, text/csv
 # @name exportComplaints
 GET {{baseUrl}}/admin/complaints/export.csv?category=LIBRARY&sort=newest
-Authorization: Bearer {{departmentToken}}
+Authorization: Bearer {{departmentLogin.response.body.$.token}}
 Accept: text/csv
 
 ### Signed image upload — 200 when CLOUDINARY_* are configured, otherwise 500
@@ -226,7 +228,7 @@ Accept: text/csv
 # Then pass the returned publicUrl in a new complaint's imageUrls array.
 # @name signUpload
 POST {{baseUrl}}/uploads/sign
-Authorization: Bearer {{studentToken}}
+Authorization: Bearer {{studentLogin.response.body.$.token}}
 Content-Type: application/json
 
 {
@@ -236,43 +238,44 @@ Content-Type: application/json
 ### SignalR negotiation — 200; use a SignalR client for handshake and live events
 # @name negotiateNotifications
 POST {{host}}/hubs/notifications/negotiate?negotiateVersion=1
-Authorization: Bearer {{studentToken}}
+Authorization: Bearer {{studentLogin.response.body.$.token}}
 
 ### Support another student's complaint — currently 403, contract decision pending
 # demo-001 belongs to student2 in the explicit demo seed.
 # @name supportComplaint
 PUT {{baseUrl}}/complaints/demo-001/support
-Authorization: Bearer {{studentToken}}
+Authorization: Bearer {{studentLogin.response.body.$.token}}
 
 ### Remove support — currently 403 under the same privacy restriction
 # @name removeSupport
 DELETE {{baseUrl}}/complaints/demo-001/support
-Authorization: Bearer {{studentToken}}
+Authorization: Bearer {{studentLogin.response.body.$.token}}
 
 ### Authorization check: student cannot read another student's complaint — 403
 # @name forbiddenStudentRead
 GET {{baseUrl}}/complaints/demo-001
-Authorization: Bearer {{studentToken}}
+Authorization: Bearer {{studentLogin.response.body.$.token}}
 
 ### Authorization check: library admin cannot read a Lab/IT complaint — 403
 # @name forbiddenDepartmentRead
 GET {{baseUrl}}/complaints/demo-002
-Authorization: Bearer {{departmentToken}}
+Authorization: Bearer {{departmentLogin.response.body.$.token}}
 
 ### Authorization check: students cannot change status — 403
 # @name forbiddenStudentStatus
-PATCH {{baseUrl}}/complaints/{{complaintId}}/status
-Authorization: Bearer {{studentToken}}
+PATCH {{baseUrl}}/complaints/{{createComplaint.response.body.$.data.id}}/status
+Authorization: Bearer {{studentLogin.response.body.$.token}}
 Content-Type: application/json
 
 {
-  "status": "IN_PROGRESS"
+  "status": "IN_PROGRESS",
+  "rowVersion": "{{departmentDetail.response.body.$.data.rowVersion}}"
 }
 
-### Optional: super administrator reopens the resolved complaint — 200
+### Super administrator cannot reopen a complaint — 403
 # @name reopenComplaint
-PATCH {{baseUrl}}/complaints/{{complaintId}}/status
-Authorization: Bearer {{superToken}}
+PATCH {{baseUrl}}/complaints/{{createComplaint.response.body.$.data.id}}/status
+Authorization: Bearer {{superLogin.response.body.$.token}}
 Content-Type: application/json
 
 {
@@ -280,13 +283,14 @@ Content-Type: application/json
   "remark": "Reopened to inspect an additional damaged chair."
 }
 
-### Optional: reject after reopening — 200; a reason is mandatory
+### Resolved complaints are terminal — 409 (refresh current version first)
 # @name rejectComplaint
-PATCH {{baseUrl}}/complaints/{{complaintId}}/status
-Authorization: Bearer {{departmentToken}}
+PATCH {{baseUrl}}/complaints/{{createComplaint.response.body.$.data.id}}/status
+Authorization: Bearer {{departmentLogin.response.body.$.token}}
 Content-Type: application/json
 
 {
   "status": "REJECTED",
+  "rowVersion": "{{resolveComplaint.response.body.$.data.rowVersion}}",
   "remark": "The remaining request duplicates an existing maintenance ticket."
 }

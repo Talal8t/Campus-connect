@@ -1,4 +1,6 @@
 using System.Text;
+using System.Net;
+using Microsoft.AspNetCore.HttpOverrides;
 using System.Threading.RateLimiting;
 using CampusConnect.Api;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
@@ -15,12 +17,29 @@ string SigningSecret()
     return value;
 }
 builder.Services.AddSingleton(_ => new JwtSettings(SigningSecret()));
-builder.Services.AddDbContext<AppDb>(o => o.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")
-    ?? builder.Configuration["DATABASE_URL"] ?? "Server=localhost,1433;Database=CampusConnect;Integrated Security=true;TrustServerCertificate=true"));
+builder.Services.AddDbContext<AppDb>(o => o.UseSqlServer(DatabaseConfiguration.RequireConnection(builder.Configuration)));
+builder.Services.AddHttpClient<CloudinaryUploads>(client => client.Timeout = TimeSpan.FromSeconds(10));
+builder.Services.Configure<ForwardedHeadersOptions>(o =>
+{
+    o.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+    o.ForwardLimit = 1;
+    o.KnownIPNetworks.Clear();
+    o.KnownProxies.Clear();
+    // Only explicit proxies are trusted; never clear these lists to trust arbitrary callers.
+    var proxies = (builder.Configuration["TRUSTED_PROXIES"] ?? "127.0.0.1,::1").Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+    if (proxies.Length == 0) throw new InvalidOperationException("TRUSTED_PROXIES requires at least one trusted proxy IP.");
+    foreach (var address in proxies)
+    {
+        if (!IPAddress.TryParse(address, out var ip)) throw new InvalidOperationException("TRUSTED_PROXIES contains an invalid IP address.");
+        o.KnownProxies.Add(ip);
+    }
+});
 builder.Services.AddScoped<CurrentUser>();
 builder.Services.AddScoped<ComplaintService>();
 builder.Services.AddScoped<AuthService>();
+builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSignalR();
+builder.Logging.AddFilter("Microsoft.AspNetCore.Hosting.Diagnostics", LogLevel.Warning);
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJwtBearer(o =>
 {
     var secret = SigningSecret();
@@ -66,11 +85,13 @@ builder.Services.AddRateLimiter(o =>
     o.OnRejected = async (c, ct) =>
     {
         c.HttpContext.Response.StatusCode = 429;
-        await c.HttpContext.Response.WriteAsJsonAsync(new { error = new { code = "CONFLICT", message = "Too many attempts. Try again shortly." } }, ct);
+        await c.HttpContext.Response.WriteAsJsonAsync(new { error = new { code = "RATE_LIMITED", message = "Too many attempts. Try again shortly." } }, ct);
     };
 });
 var app = builder.Build();
 _ = app.Services.GetRequiredService<JwtSettings>();
+_ = DatabaseConfiguration.RequireConnection(app.Configuration);
+app.UseForwardedHeaders();
 app.Use(async (c, next) =>
 {
     c.Response.Headers.XContentTypeOptions = "nosniff";
@@ -85,7 +106,7 @@ app.Use(async (c, next) =>
             BadHttpRequestException => ApiError.Invalid("Malformed request body or parameters."),
             DbUpdateConcurrencyException => new ApiError(409, "CONFLICT", "The resource changed. Refresh and try again."),
             DbUpdateException => new ApiError(409, "CONFLICT", "The operation conflicts with an existing record."),
-            SqlException sql when sql.Number == 1205 => new ApiError(409, "CONFLICT", "A concurrent operation conflicted. Retry the request."),
+            _ when DatabaseConflicts.IsRace(e) => new ApiError(409, "CONFLICT", "A concurrent operation conflicted. Retry the request."),
             _ => new ApiError(500, "INTERNAL", "An unexpected error occurred.")
         };
         if (error.Status == 500) app.Logger.LogError(e, "Request failed: {Path}", c.Request.Path);
@@ -97,7 +118,11 @@ app.UseCors();
 app.UseRateLimiter();
 app.UseAuthentication();
 app.UseAuthorization();
-app.MapGet("/api/v1/health", () => Results.Ok(new { status = "ok" }));
+app.MapGet("/api/v1/health", async (AppDb db, CancellationToken cancellationToken) =>
+{
+    var connected = await db.Database.CanConnectAsync(cancellationToken);
+    return Results.Json(new { status = connected ? "ok" : "unavailable" }, statusCode: connected ? 200 : 503);
+});
 app.MapGet("/api/v1/meta/categories", async (AppDb db) =>
 {
     var departments = await db.Departments.AsNoTracking().ToListAsync();
@@ -115,8 +140,9 @@ if (args.Contains("--migrate") || args.Contains("--seed"))
 {
     await using var scope = app.Services.CreateAsyncScope();
     var db = scope.ServiceProvider.GetRequiredService<AppDb>();
+    var seedPassword = args.Contains("--seed") ? Seed.RequirePassword(app.Configuration) : null;
     await db.Database.MigrateAsync();
-    if (args.Contains("--seed")) await Seed.Run(db);
+    if (seedPassword is not null) await Seed.Run(db, seedPassword);
     return;
 }
 await app.RunAsync();

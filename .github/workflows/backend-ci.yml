@@ -31,6 +31,7 @@ jobs:
     env:
       TEST_DATABASE_URL: 'Server=localhost,1433;User Id=sa;Password=Ci_Only_Strong_Pass123!;TrustServerCertificate=true'
       JWT_SECRET: ci-only-signing-key-with-at-least-32-bytes
+      ConnectionStrings__DefaultConnection: 'Server=localhost,1433;Database=CampusConnect_Design;User Id=sa;Password=Ci_Only_Strong_Pass123!;TrustServerCertificate=true;Encrypt=true'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4

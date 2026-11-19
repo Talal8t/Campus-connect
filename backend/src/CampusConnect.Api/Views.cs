@@ -18,11 +18,11 @@ public static class Views
             ["supportCount"] = c.Supports.Count, ["supportedByMe"] = c.Supports.Any(s => s.UserId == u.Id),
             ["isOverdue"] = (c.Status is "PENDING" or "IN_PROGRESS") && c.DueAt < DateTime.UtcNow, ["dueAt"] = c.DueAt,
             ["author"] = c.AnonymousToStaff && u.Role == Roles.Admin ? null : new { c.Author.Id, c.Author.Name, c.Author.StudentId },
-            ["createdAt"] = c.CreatedAt, ["updatedAt"] = c.UpdatedAt, ["resolvedAt"] = c.ResolvedAt
+            ["createdAt"] = c.CreatedAt, ["updatedAt"] = c.UpdatedAt, ["resolvedAt"] = c.ResolvedAt, ["rowVersion"] = c.Version
         };
         if (detail)
         {
-            result["timeline"] = c.Timeline.OrderBy(t => t.CreatedAt).Select(t => Timeline(t, c, u));
+            result["timeline"] = c.Timeline.OrderBy(t => t.CreatedAt).ThenBy(t => t.Id).Select(t => Timeline(t, c, u));
             result["feedback"] = c.Feedback is null ? null : new { c.Feedback.Rating, c.Feedback.Comment };
             result["allowedTransitions"] = Catalog.Transitions(c.Status, u.Role);
         }

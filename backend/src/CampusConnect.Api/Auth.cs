@@ -56,6 +56,7 @@ public static class Scope
         throw ApiError.Forbidden();
     }
     public static void Admin(User u) { if (u.Role is not (Roles.Admin or Roles.Super)) throw ApiError.Forbidden(); }
+    public static void DepartmentAdmin(User u) { if (u.Role != Roles.Admin) throw ApiError.Forbidden(); }
     public static void Student(User u) { if (u.Role != Roles.Student) throw ApiError.Forbidden(); }
 }
 [Authorize]

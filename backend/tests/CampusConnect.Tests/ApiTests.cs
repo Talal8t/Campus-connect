@@ -14,6 +14,7 @@ namespace CampusConnect.Tests;
 public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
 {
     public string Connection { get; } = ConnectionString();
+    public string SeedPassword { get; } = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));
     private static string ConnectionString()
     {
         var value = Environment.GetEnvironmentVariable("TEST_DATABASE_URL") ?? "Server=(localdb)\\MSSQLLocalDB;Integrated Security=true;TrustServerCertificate=true";
@@ -39,7 +40,7 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         using var client = CreateClient();
         await using var scope = Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDb>();
-        await db.Database.MigrateAsync(); await Seed.Run(db);
+        await db.Database.MigrateAsync(); await Seed.Run(db, SeedPassword);
     }
     public new async Task DisposeAsync()
     {
@@ -50,7 +51,7 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
     public async Task<HttpClient> Login(string name)
     {
         var client = CreateClient();
-        var response = await client.PostAsJsonAsync("/api/v1/auth/login", new { email = name + "@campusconnect.edu", password = "Campus@123" });
+        var response = await client.PostAsJsonAsync("/api/v1/auth/login", new { email = name + "@campusconnect.edu", password = SeedPassword });
         response.EnsureSuccessStatusCode();
         var body = await response.Content.ReadFromJsonAsync<JsonObject>();
         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", body!["token"]!.GetValue<string>());
@@ -81,7 +82,7 @@ public class ApiTests(ApiFactory factory) : IClassFixture<ApiFactory>
     public async Task Department_admin_cannot_change_other_department_status()
     {
         using var client = await factory.Login("library");
-        var response = await client.PatchAsJsonAsync("/api/v1/complaints/demo-002/status", new { status = "IN_PROGRESS" });
+        var response = await client.PatchStatusAsync("/api/v1/complaints/demo-002/status", new { status = "IN_PROGRESS" });
         await AssertError(response, HttpStatusCode.Forbidden, "FORBIDDEN");
     }
     [Theory]
@@ -100,7 +101,7 @@ public class ApiTests(ApiFactory factory) : IClassFixture<ApiFactory>
     public async Task Students_cannot_change_status_or_escalate_registration_role()
     {
         using var student = await factory.Login("student");
-        await AssertError(await student.PatchAsJsonAsync("/api/v1/complaints/demo-000/status", new { status = "IN_PROGRESS" }), HttpStatusCode.Forbidden, "FORBIDDEN");
+        await AssertError(await student.PatchStatusAsync("/api/v1/complaints/demo-000/status", new { status = "IN_PROGRESS" }), HttpStatusCode.Forbidden, "FORBIDDEN");
         using var anonymous = factory.CreateClient();
         var response = await anonymous.PostAsJsonAsync("/api/v1/auth/register", new { name = "New Student", email = Guid.NewGuid() + "@test.edu", password = "Campus@123", role = "SUPER_ADMIN", departmentId = "dept-library" });
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
@@ -132,11 +133,11 @@ public class ApiTests(ApiFactory factory) : IClassFixture<ApiFactory>
         Assert.Equal("Anonymous student", view["timeline"]![0]!["actor"]!["name"]!.GetValue<string>());
         var superView = (await super.GetFromJsonAsync<JsonObject>("/api/v1/complaints/" + id))!["data"]!;
         Assert.NotNull(superView["author"]);
-        await AssertError(await admin.PatchAsJsonAsync($"/api/v1/complaints/{id}/status", new { status = "RESOLVED", remark = "done" }), HttpStatusCode.Conflict, "INVALID_TRANSITION");
-        Assert.Equal(HttpStatusCode.OK, (await admin.PatchAsJsonAsync($"/api/v1/complaints/{id}/status", new { status = "IN_PROGRESS" })).StatusCode);
-        await AssertError(await admin.PatchAsJsonAsync($"/api/v1/complaints/{id}/status", new { status = "RESOLVED" }), HttpStatusCode.UnprocessableEntity, "VALIDATION_FAILED");
+        await AssertError(await admin.PatchStatusAsync($"/api/v1/complaints/{id}/status", new { status = "RESOLVED", remark = "done" }), HttpStatusCode.Conflict, "INVALID_TRANSITION");
+        Assert.Equal(HttpStatusCode.OK, (await admin.PatchStatusAsync($"/api/v1/complaints/{id}/status", new { status = "IN_PROGRESS" })).StatusCode);
+        await AssertError(await admin.PatchStatusAsync($"/api/v1/complaints/{id}/status", new { status = "RESOLVED" }), HttpStatusCode.UnprocessableEntity, "VALIDATION_FAILED");
         Assert.Equal(HttpStatusCode.Created, (await admin.PostAsJsonAsync($"/api/v1/complaints/{id}/comments", new { body = "We are repairing the desk." })).StatusCode);
-        Assert.Equal(HttpStatusCode.OK, (await admin.PatchAsJsonAsync($"/api/v1/complaints/{id}/status", new { status = "RESOLVED", remark = "Equipment repaired." })).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await admin.PatchStatusAsync($"/api/v1/complaints/{id}/status", new { status = "RESOLVED", remark = "Equipment repaired." })).StatusCode);
         Assert.Equal(HttpStatusCode.Created, (await student.PostAsJsonAsync($"/api/v1/complaints/{id}/feedback", new { rating = 5, comment = "Thanks" })).StatusCode);
         await AssertError(await student.PostAsJsonAsync($"/api/v1/complaints/{id}/feedback", new { rating = 4 }), HttpStatusCode.Conflict, "CONFLICT");
         var detail = (await student.GetFromJsonAsync<JsonObject>($"/api/v1/complaints/{id}"))!["data"]!;
@@ -147,7 +148,7 @@ public class ApiTests(ApiFactory factory) : IClassFixture<ApiFactory>
         var otherNotes = await other.GetFromJsonAsync<JsonObject>("/api/v1/notifications");
         Assert.DoesNotContain(otherNotes!["data"]!.AsArray(), n => n!["complaintId"]!.GetValue<string>() == id);
         Assert.Equal(HttpStatusCode.NoContent, (await student.PostAsync("/api/v1/notifications/read-all", null)).StatusCode);
-        Assert.Equal(HttpStatusCode.OK, (await super.PatchAsJsonAsync($"/api/v1/complaints/{id}/status", new { status = "IN_PROGRESS" })).StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, (await super.PatchStatusAsync($"/api/v1/complaints/{id}/status", new { status = "IN_PROGRESS" })).StatusCode);
     }
     [Fact]
     public async Task Auth_validation_and_missing_tokens_use_error_envelope()
@@ -167,7 +168,7 @@ public class ApiTests(ApiFactory factory) : IClassFixture<ApiFactory>
         foreach (var path in new[] { "summary", "by-status", "trend?days=7", "recurring" })
             Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/api/v1/analytics/" + path)).StatusCode);
         await using var scope = factory.Services.CreateAsyncScope(); var db = scope.ServiceProvider.GetRequiredService<AppDb>();
-        var count = await db.Complaints.CountAsync(); await Seed.Run(db); Assert.Equal(count, await db.Complaints.CountAsync());
+        var count = await db.Complaints.CountAsync(); await Seed.Run(db, factory.SeedPassword); Assert.Equal(count, await db.Complaints.CountAsync());
     }
     [Fact]
     public async Task SignalR_requires_authentication_and_support_preserves_scope()

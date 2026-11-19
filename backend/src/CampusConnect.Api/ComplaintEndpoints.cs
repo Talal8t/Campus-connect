@@ -1,4 +1,3 @@
-using System.Security.Cryptography;
 using System.Text;
 using Microsoft.EntityFrameworkCore;
 
@@ -19,8 +18,8 @@ public static class ComplaintEndpoints
             return Results.Ok(new { data = rows.Select(c => Views.Complaint(c, u)), page, pageSize, total });
         });
         api.MapGet("/complaints/{id}", async (string id, ComplaintService s, CurrentUser u) => Results.Ok(new { data = Views.Complaint(await s.Load(id), await u.Get(), true) }));
-        api.MapPatch("/complaints/{id}/status", async (string id, StatusRequest r, ComplaintService s) => Results.Ok(new { data = await s.ChangeStatus(id, r) })).RequireAuthorization(p => p.RequireRole(Roles.Admin, Roles.Super));
-        api.MapPost("/complaints/{id}/comments", async (string id, CommentRequest r, ComplaintService s) => Results.Json(new { data = await s.Comment(id, r) }, statusCode: 201));
+        api.MapPatch("/complaints/{id}/status", async (string id, StatusRequest r, ComplaintService s) => Results.Ok(new { data = await s.ChangeStatus(id, r) })).RequireAuthorization(p => p.RequireRole(Roles.Admin));
+        api.MapPost("/complaints/{id}/comments", async (string id, CommentRequest r, ComplaintService s) => Results.Json(new { data = await s.Comment(id, r) }, statusCode: 201)).RequireAuthorization(p => p.RequireRole(Roles.Admin));
         api.MapPost("/complaints/{id}/feedback", async (string id, FeedbackRequest r, ComplaintService s) => Results.Json(new { data = await s.Feedback(id, r) }, statusCode: 201)).RequireAuthorization(p => p.RequireRole(Roles.Student));
         api.MapPut("/complaints/{id}/support", async (string id, ComplaintService s) => Results.Ok(await s.Support(id, true))).RequireAuthorization(p => p.RequireRole(Roles.Student));
         api.MapDelete("/complaints/{id}/support", async (string id, ComplaintService s) => Results.Ok(await s.Support(id, false))).RequireAuthorization(p => p.RequireRole(Roles.Student));
@@ -37,27 +36,15 @@ public static class ComplaintEndpoints
             var u = await current.Get(); await db.Notifications.Where(x => x.UserId == u.Id && !x.Read).ExecuteUpdateAsync(s => s.SetProperty(x => x.Read, true));
             return Results.NoContent();
         });
-        api.MapPost("/uploads/sign", async (UploadRequest r, CurrentUser current, IConfiguration config) =>
-        {
-            Scope.Student(await current.Get());
-            var cloud = config["CLOUDINARY_CLOUD_NAME"]; var key = config["CLOUDINARY_API_KEY"]; var secret = config["CLOUDINARY_API_SECRET"];
-            if (string.IsNullOrWhiteSpace(cloud) || string.IsNullOrWhiteSpace(key) || string.IsNullOrWhiteSpace(secret)) throw new ApiError(500, "INTERNAL", "Image upload service is not configured.");
-            var id = "campusconnect/" + Guid.NewGuid().ToString("N");
-            var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
-            // Cloudinary requires alphabetically sorted signed parameters and a SHA-1 suffix signature.
-            var parameters = $"overwrite=false&public_id={id}&timestamp={timestamp}";
-            var signature = Convert.ToHexStringLower(SHA1.HashData(Encoding.UTF8.GetBytes(parameters + secret)));
-            return Results.Ok(new { data = new { uploadUrl = $"https://api.cloudinary.com/v1_1/{cloud}/image/upload",
-                fields = new Dictionary<string, string> { ["api_key"] = key, ["timestamp"] = timestamp, ["public_id"] = id, ["overwrite"] = "false", ["signature"] = signature },
-                publicUrl = $"https://res.cloudinary.com/{cloud}/image/upload/{id}" } });
-        }).RequireAuthorization(p => p.RequireRole(Roles.Student));
+        api.MapPost("/uploads/sign", async (UploadRequest r, CurrentUser current, CloudinaryUploads uploads) =>
+            Results.Ok(new { data = uploads.Sign(r, await current.Get()) })).RequireAuthorization(p => p.RequireRole(Roles.Student));
         api.MapGet("/admin/complaints/export.csv", async (CurrentUser current, ComplaintService s, HttpRequest r) =>
         {
             var u = await current.Get(); Scope.Admin(u);
             var rows = await ComplaintQuery.Filter(s.Full.AsNoTracking(), u, r).ToListAsync();
             static string Cell(string v)
             {
-                if (v.TrimStart().StartsWith('=') || v.TrimStart().StartsWith('+') || v.TrimStart().StartsWith('-') || v.TrimStart().StartsWith('@')) v = "'" + v;
+                if (v.StartsWith('\t') || v.StartsWith('\r') || v.TrimStart().StartsWith('=') || v.TrimStart().StartsWith('+') || v.TrimStart().StartsWith('-') || v.TrimStart().StartsWith('@')) v = "'" + v;
                 return "\"" + v.Replace("\"", "\"\"") + "\"";
             }
             var csv = new StringBuilder("ticket,title,category,department,status,priority,createdAt\r\n");
